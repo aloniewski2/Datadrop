@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+
+/* ── Theme tokens ─────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: dark;
+  --bg:       #080808;   /* page background          */
+  --bg-d:     #040404;   /* landing deep background  */
+  --sf:       #0d0d0d;   /* card / panel surface     */
+  --sf2:      #131313;   /* elevated buttons / rows  */
+  --ln:       #1c1c1c;   /* subtle border / divider  */
+  --ln2:      #272727;   /* normal border            */
+  --ln3:      #383838;   /* strong / hover border    */
+  --t1:       #efefef;   /* primary text             */
+  --t2:       #b0b0b0;   /* secondary text           */
+  --t3:       #6e6e6e;   /* muted text               */
+  --t4:       #3c3c3c;   /* faint / ghost text       */
+  --t5:       #252525;   /* near-invisible           */
+  --afg:      #818cf8;   /* accent foreground        */
+  --nav-blur: rgba(8,8,8,0.93);
+  --err-bg:   #110707;
+  --err-br:   #3a1515;
+  --err-fg:   #e08080;
+}
+
+:root.light {
+  color-scheme: light;
+  --bg:       #f5f5f5;
+  --bg-d:     #ebebeb;
+  --sf:       #ffffff;
+  --sf2:      #f0f0f0;
+  --ln:       #e8e8e8;
+  --ln2:      #d4d4d4;
+  --ln3:      #b0b0b0;
+  --t1:       #0a0a0a;
+  --t2:       #3c3c3c;
+  --t3:       #737373;
+  --t4:       #a8a8a8;
+  --t5:       #d8d8d8;
+  --afg:      #4f46e5;
+  --nav-blur: rgba(245,245,245,0.93);
+  --err-bg:   #fff5f5;
+  --err-br:   #fecaca;
+  --err-fg:   #dc2626;
+}
+
+/* ── Base ─────────────────────────────────────────────────────────────────── */
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--bg);
+  color: var(--t1);
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+/* Recharts axis tick text */
+.recharts-text { fill: var(--t3); }
+
+/* Chart card fade-in */
+@keyframes chartFadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.chart-fade-in { animation: chartFadeIn 0.25s ease forwards; }
+
+/* Dot grid background for landing hero */
+.dot-grid {
+  background-image: radial-gradient(circle, var(--ln2) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Toast slide-in */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Button press micro-animation */
+button:active:not(:disabled) { transform: scale(0.97); transition: transform 0.08s ease; }
