@@ -1,4 +1,4 @@
-# Fathom — Documentation
+# DataDropAI — Documentation
 
 > Ask your data anything. Drop a CSV or Google Sheet, type a question in plain English, get a chart in seconds — no code, no setup.
 
@@ -23,7 +23,7 @@
 
 ## Overview
 
-Fathom is a single-page React application that lets non-technical users explore tabular data through natural-language queries. It uses the Groq LLM API to convert plain-English questions into structured chart configurations, which are then rendered via Recharts.
+DataDropAI is a single-page React application that lets non-technical users explore tabular data through natural-language queries. It uses the Groq LLM API to convert plain-English questions into structured chart configurations, which are then rendered via Recharts.
 
 **Stack at a glance:**
 
@@ -380,10 +380,10 @@ All state lives in the root `App` component. No external state library is used.
 
 ```
 localStorage:
-  fathom_session  →  { columns, dataLabel, chartConfig, chartData,
-                       chartHistory[0..4], pins[0..9], query, palette }
-  fathom_theme    →  'dark' | 'light'
-  fathom_key      →  Groq API key (if user provided one)
+  datadropai_session  →  { columns, dataLabel, chartConfig, chartData,
+                           chartHistory[0..4], pins[0..9], query, palette }
+  datadropai_theme    →  'dark' | 'light'
+  datadropai_key      →  Groq API key (if user provided one)
 ```
 
 ---
@@ -414,7 +414,7 @@ Five palettes are available. Colors within each palette are ordered so that the 
 
 | Palette | Colors (first 4) | Use case |
 |---------|-----------------|---------|
-| **Fathom** | Indigo, Amber, Emerald, Red | Default — warm/cool balance |
+| **DataDropAI** | Indigo, Amber, Emerald, Red | Default — warm/cool balance |
 | **Warm** | Amber, Red, Pink, Orange | Warm tonality |
 | **Cool** | Cyan, Violet, Blue, Sky | Cool tonality |
 | **Mono** | Gray scale | Print / minimal |
@@ -519,7 +519,7 @@ Permissions-Policy: camera=(), microphone=(), geolocation=()
 
 | Feature | Details |
 |---------|---------|
-| PNG export | html2canvas, 2× resolution, optional "Built with Fathom" watermark |
+| PNG export | html2canvas, 2× resolution, optional "Built with DataDropAI" watermark |
 | CSV export | Chart data (post-aggregation) as downloadable CSV |
 | Copy as JSON | Chart data copied to clipboard as formatted JSON |
 | Share chart | Base64 URL encodes config + up to 150 data rows |
@@ -539,7 +539,7 @@ Permissions-Policy: camera=(), microphone=(), geolocation=()
 | Feature | Details |
 |---------|---------|
 | Dark / Light theme | Toggled via header button, persisted to localStorage |
-| 5 color palettes | Fathom, Warm, Cool, Mono, Colorblind |
+| 5 color palettes | DataDropAI, Warm, Cool, Mono, Colorblind |
 | Stats strip | Auto-computed min/avg/max + sparkline for every numeric column; top categories for categorical columns |
 | Data preview accordion | Smooth CSS max-height transition |
 | History strip | Last 12 charts as scrollable cards, click to restore |
@@ -568,7 +568,7 @@ Permissions-Policy: camera=(), microphone=(), geolocation=()
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GROQ_API_KEY` | Yes (server) | Groq API key — set in Vercel project settings, never in code |
-| `ALLOWED_ORIGIN` | Recommended | Restricts CORS to your deployment URL, e.g. `https://fathom.yourdomain.com` |
+| `ALLOWED_ORIGIN` | Recommended | Restricts CORS to your deployment URL, e.g. `https://datadropai.yourdomain.com` |
 
 ### Local Development
 
