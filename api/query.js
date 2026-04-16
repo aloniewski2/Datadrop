@@ -3,8 +3,8 @@
 
 const rateMap = new Map()
 const VALID_ROLES = new Set(['system', 'user', 'assistant'])
-const MAX_MESSAGES = 10
-const MAX_CONTENT_LEN = 20_000 // characters across all messages combined
+const MAX_MESSAGES = 12
+const MAX_CONTENT_LEN = 28_000 // characters across all messages combined
 const UPSTREAM_TIMEOUT_MS = 25_000
 
 function isRateLimited(ip) {
@@ -72,6 +72,8 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Request too large' })
   }
 
+  const wantStream = req.body?.stream === true
+
   // ── Upstream request with timeout ──────────────────────────────────────────
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
@@ -87,16 +89,39 @@ export default async function handler(req, res) {
         model: 'llama-3.3-70b-versatile',
         messages,
         temperature: 0.1,
-        max_tokens: 600,
+        max_tokens: 900,
         response_format: { type: 'json_object' },
+        stream: wantStream,
       }),
       signal: controller.signal,
     })
     clearTimeout(timer)
 
-    const data = await upstream.json()
-    if (!upstream.ok) return res.status(upstream.status).json(data)
+    if (!upstream.ok) {
+      const data = await upstream.json()
+      return res.status(upstream.status).json(data)
+    }
 
+    if (wantStream) {
+      // Forward SSE stream to client
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('X-Accel-Buffering', 'no')
+      const reader = upstream.body.getReader()
+      const decoder = new TextDecoder()
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          res.write(decoder.decode(value, { stream: true }))
+        }
+      } finally {
+        res.end()
+      }
+      return
+    }
+
+    const data = await upstream.json()
     res.json({ content: data.choices[0].message.content })
   } catch (e) {
     clearTimeout(timer)

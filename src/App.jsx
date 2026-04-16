@@ -10,12 +10,15 @@ import {
   ScatterChart, Scatter,
   PieChart, Pie, Cell,
   ComposedChart,
+  FunnelChart, Funnel,
   XAxis, YAxis, ZAxis,
   CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, ReferenceLine,
+  LabelList,
 } from 'recharts'
 import * as d3 from 'd3'
 import html2canvas from 'html2canvas'
+import * as XLSX from 'xlsx'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -35,12 +38,13 @@ const PALETTE_NAMES = {
 
 // Uses CSS vars — works in both dark and light themes
 const TT = {
-  backgroundColor: 'var(--sf)',
+  backgroundColor: 'var(--sf3)',
   border: '1px solid var(--ln2)',
-  borderRadius: '8px',
+  borderRadius: '10px',
   color: 'var(--t1)',
   fontSize: '12px',
-  boxShadow: '0 4px 20px rgba(0,0,0,0.25)',
+  padding: '8px 12px',
+  boxShadow: 'var(--shadow-md)',
 }
 
 const CHIPS = [
@@ -54,13 +58,13 @@ const CHIPS = [
 
 const CHART_LABEL = {
   bar: 'Bar', line: 'Line', area: 'Area', scatter: 'Scatter',
-  bubble: 'Bubble', pie: 'Pie', donut: 'Donut', heatmap: 'Heatmap', composed: 'Composed',
+  bubble: 'Bubble', pie: 'Pie', donut: 'Donut', heatmap: 'Heatmap', composed: 'Composed', funnel: 'Funnel',
 }
 
 // Max data points rendered per chart type — keeps Recharts from crashing on huge datasets
 const CHART_MAX_PTS = {
   bar: 200, line: 2000, area: 2000, scatter: 8000,
-  bubble: 4000, pie: 60, donut: 60, heatmap: 3000, composed: 2000,
+  bubble: 4000, pie: 60, donut: 60, heatmap: 3000, composed: 2000, funnel: 200,
 }
 
 function sampleForChart(data, chartType) {
@@ -209,7 +213,65 @@ function normalizeConfig(cfg, columns) {
     filter: cfg.filter?.column
       ? { column: resolveCol(cfg.filter.column, columns), values: cfg.filter.values ?? [] }
       : null,
+    sortBy: cfg.sortBy || 'none',
+    sortOrder: cfg.sortOrder || 'desc',
+    limit: (typeof cfg.limit === 'number' && cfg.limit > 0) ? cfg.limit : null,
   }
+}
+
+// Period-over-period trend: compares last ~20% of rows vs prior ~20% on each numeric column.
+// Requires a date-type column to sort by. Returns null if not enough data.
+function computeTrends(rows, columns) {
+  const dateCol = columns.find(c => c.type === 'date')
+  if (!dateCol || rows.length < 4) return null
+  const numCols = columns.filter(c => c.type === 'numeric').slice(0, 5)
+  if (!numCols.length) return null
+  const sorted = [...rows].sort((a, b) =>
+    String(a[dateCol.name]).localeCompare(String(b[dateCol.name]))
+  )
+  const n = Math.max(1, Math.floor(sorted.length * 0.2))
+  const recent = sorted.slice(-n)
+  const prior  = sorted.slice(-2 * n, -n)
+  if (!prior.length) return null
+  const mean = (arr, col) => {
+    const vals = arr.map(r => Number(r[col])).filter(v => !isNaN(v))
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null
+  }
+  return numCols.map(c => {
+    const r = mean(recent, c.name), p = mean(prior, c.name)
+    if (r === null || p === null || p === 0) return null
+    return { col: c.name, pct: ((r - p) / Math.abs(p)) * 100, recent: r, prior: p }
+  }).filter(Boolean)
+}
+
+// Natural-language row filter: "sales > 1000 and region = West"
+function applyRowFilter(rows, expr) {
+  if (!expr.trim()) return rows
+  const OPS = {
+    '>=': (a, b) => Number(a) >= Number(b),
+    '<=': (a, b) => Number(a) <= Number(b),
+    '!=': (a, b) => String(a).toLowerCase() !== String(b).toLowerCase(),
+    '>':  (a, b) => Number(a) > Number(b),
+    '<':  (a, b) => Number(a) < Number(b),
+    '=':  (a, b) => String(a).toLowerCase() === String(b).toLowerCase(),
+    'contains': (a, b) => String(a).toLowerCase().includes(String(b).toLowerCase()),
+  }
+  const RE = /^(.+?)\s*(>=|<=|!=|contains|>|<|=)\s*(.+)$/i
+  function evalCond(cond, row) {
+    const m = cond.trim().match(RE)
+    if (!m) return true
+    const [, col, op, raw] = m
+    const key = Object.keys(row).find(k => k.toLowerCase() === col.trim().toLowerCase()) ?? col.trim()
+    const val = raw.trim().replace(/^["']|["']$/g, '')
+    return OPS[op.toLowerCase()]?.(row[key] ?? '', val) ?? true
+  }
+  try {
+    return rows.filter(row =>
+      expr.split(/\band\b/i).every(andPart =>
+        andPart.split(/\bor\b/i).some(orPart => evalCond(orPart, row))
+      )
+    )
+  } catch { return rows }
 }
 
 function pivotGroupBy(data, xAxis, groupBy, valueCol) {
@@ -307,6 +369,41 @@ function aggregateData(rows, config, columns) {
   })
 }
 
+// Pick the best initial chart type based on column types alone — no AI needed
+function pickInitialChart(columns) {
+  const dateCol = columns.find(c => c.type === 'date')
+  const numCol  = columns.find(c => c.type === 'numeric')
+  const catCol  = columns.find(c => c.type === 'categorical')
+  if (!numCol) return null
+  const yLabel = numCol.name
+  if (dateCol && catCol) {
+    return {
+      chartType: 'line', title: `${yLabel} over time by ${catCol.name}`,
+      xAxis: dateCol.name, yAxis: yLabel, groupBy: catCol.name,
+      aggregation: 'sum', sortBy: 'xAxis', sortOrder: 'asc', limit: null,
+    }
+  }
+  if (dateCol) {
+    return {
+      chartType: 'area', title: `${yLabel} over time`,
+      xAxis: dateCol.name, yAxis: yLabel,
+      aggregation: 'sum', sortBy: 'xAxis', sortOrder: 'asc', limit: null,
+    }
+  }
+  if (catCol) {
+    return {
+      chartType: 'bar', title: `${yLabel} by ${catCol.name}`,
+      xAxis: catCol.name, yAxis: yLabel,
+      aggregation: 'sum', sortBy: 'yAxis', sortOrder: 'desc', limit: null,
+    }
+  }
+  return {
+    chartType: 'bar', title: `${yLabel} overview`,
+    xAxis: columns[0].name, yAxis: yLabel,
+    aggregation: 'none', sortBy: 'none', sortOrder: 'desc', limit: null,
+  }
+}
+
 function fmtTick(v) {
   if (typeof v !== 'number') return v
   if (Math.abs(v) >= 1_000_000) return (v / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M'
@@ -363,12 +460,13 @@ function getFollowUps(config, columns) {
 
 function buildSystemPrompt(columns, rows) {
   const schema = columns.map(c => `${c.name} (${c.type})`).join(', ')
-  const sample = rows.slice(0, 5).map(r => JSON.stringify(r)).join('\n')
+  const sample = rows.slice(0, 8).map(r => JSON.stringify(r)).join('\n')
   return `You are a data visualization expert. Return ONLY a valid JSON object — no markdown, no explanation.
 
 JSON schema:
 {
-  "chartType": "bar"|"line"|"area"|"scatter"|"bubble"|"pie"|"donut"|"heatmap"|"composed",
+  "answerType": "chart"|"insight",
+  "chartType": "bar"|"line"|"area"|"scatter"|"bubble"|"pie"|"donut"|"heatmap"|"composed"|"funnel",
   "title": "concise descriptive title",
   "xAxis": "exact column name",
   "yAxis": "exact column name OR array of column names",
@@ -376,20 +474,29 @@ JSON schema:
   "aggregation": "sum"|"avg"|"count"|"none",
   "colorBy": "exact column name or null",
   "filter": {"column": "exact column name", "values": ["value1", "value2"]} or null,
-  "insight": "one sentence plain-English insight"
+  "sortBy": "xAxis"|"yAxis"|"none",
+  "sortOrder": "asc"|"desc",
+  "limit": null or integer (top N rows after sort),
+  "insight": "one sentence plain-English insight",
+  "answer": "plain-English answer if answerType is insight"
 }
 
 Rules:
 - Use EXACT column names from the dataset
+- answerType="insight" for questions that don't need a chart (e.g. "what is the total?", "which has the highest?")
+- answerType="chart" for all visualization requests
 - bar/line/area: xAxis = category or date, yAxis = numeric col(s)
 - scatter: xAxis & yAxis = two numeric cols, aggregation = "none"
 - bubble: xAxis = numeric, yAxis = [y_col, size_col], aggregation = "none"
 - pie/donut: xAxis = category, yAxis = single numeric col
 - heatmap: xAxis = first categorical, yAxis = second categorical
 - composed: yAxis = array; first → bars, rest → lines
+- funnel: xAxis = stage/category col, yAxis = single numeric col (shows conversion stages)
 - groupBy creates grouped/multi-series charts
 - Prefer date cols on xAxis for trend queries
-- Use filter when the user specifies particular items to include (e.g. "compare USA and China", "only show Q1 and Q2")
+- Use filter when the user specifies particular items (e.g. "compare USA and China", "only Q1 and Q2")
+- Use sortBy + limit for "top N" queries (e.g. "top 10 products" → sortBy="yAxis", sortOrder="desc", limit=10)
+- Use sortBy="xAxis" to sort alphabetically/chronologically
 
 Dataset columns: ${schema}
 Sample rows:
@@ -418,7 +525,7 @@ async function queryLLM(messages, userKey) {
       model: 'llama-3.3-70b-versatile',
       messages,
       temperature: 0.1,
-      max_tokens: 600,
+      max_tokens: 900,
       response_format: { type: 'json_object' },
     }),
   })
@@ -429,6 +536,48 @@ async function queryLLM(messages, userKey) {
     throw err
   }
   return data.choices[0].message.content
+}
+
+// Streaming variant — calls onChunk(accumulatedText) for each SSE delta
+async function streamQueryLLM(messages, userKey, onChunk) {
+  const url = userKey
+    ? 'https://api.groq.com/openai/v1/chat/completions'
+    : '/api/query'
+  const body = userKey
+    ? { model: 'llama-3.3-70b-versatile', messages, temperature: 0.1, max_tokens: 900, stream: true, response_format: { type: 'json_object' } }
+    : { messages, stream: true }
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(userKey ? { Authorization: `Bearer ${userKey}` } : {}),
+  }
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    const err = new Error(data.error?.message || data.error || `Error ${res.status}`)
+    err.status = res.status
+    throw err
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let accumulated = ''
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    const lines = buf.split('\n')
+    buf = lines.pop() // keep incomplete line
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (raw === '[DONE]') continue
+      try {
+        const delta = JSON.parse(raw).choices?.[0]?.delta?.content ?? ''
+        if (delta) { accumulated += delta; onChunk(accumulated) }
+      } catch {}
+    }
+  }
+  return accumulated
 }
 
 async function generateSuggestions(columns, rows, userKey) {
@@ -445,6 +594,158 @@ async function generateSuggestions(columns, rows, userKey) {
   const raw = await queryLLM(messages, userKey)
   const parsed = JSON.parse(raw)
   return Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 5) : []
+}
+
+async function generateDatasetProfile(columns, rows, userKey) {
+  const schema = columns.map(c => `${c.name} (${c.type})`).join(', ')
+  const sample = rows.slice(0, 6).map(r => JSON.stringify(r)).join('\n')
+  const messages = [
+    {
+      role: 'system',
+      content: 'You are a data analyst. Return ONLY valid JSON — no markdown, no explanation.',
+    },
+    {
+      role: 'user',
+      content: `Analyze this dataset and return a JSON object describing what it measures.
+
+Schema: ${schema}
+Sample rows:
+${sample}
+
+Return exactly: {"summary": "one sentence describing what this dataset tracks", "columns": [{"name": "exact col name", "role": "metric"|"dimension"|"id"|"date", "description": "brief description"}]}
+
+role definitions:
+- metric: a numeric measurement (sales, revenue, count, rate)
+- dimension: a categorical grouping (country, category, name)
+- id: a unique identifier
+- date: a time/date column`,
+    },
+  ]
+  const raw = await queryLLM(messages, userKey)
+  return JSON.parse(raw)
+}
+
+async function explainChart(config, data, userKey, eli5 = false) {
+  const sample = data.slice(0, 12).map(r => JSON.stringify(r)).join('\n')
+  const instruction = eli5
+    ? `Explain this chart like the reader is 5 years old. Use simple everyday words and a real-world analogy a child would understand. No numbers in percentage form — say "almost double" instead of "+97%". 2-3 sentences max.`
+    : `Explain this chart to a non-technical person in 2-3 sentences. Focus on the key pattern, trend, or finding.`
+  const messages = [
+    { role: 'system', content: 'You are a data analyst. Return ONLY valid JSON.' },
+    {
+      role: 'user',
+      content: `${instruction}
+
+Chart title: ${config.title}
+Chart type: ${config.chartType}
+X axis: ${config.xAxis}, Y axis: ${Array.isArray(config.yAxis) ? config.yAxis.join(', ') : config.yAxis}
+Data sample:
+${sample}
+
+Return: {"explanation": "your explanation"}`,
+    },
+  ]
+  const raw = await queryLLM(messages, userKey)
+  return JSON.parse(raw)
+}
+
+async function generateSmartOverview(columns, rows, userKey) {
+  const schema = columns.map(c => `${c.name} (${c.type})`).join(', ')
+  const sample = rows.slice(0, 10).map(r => JSON.stringify(r)).join('\n')
+  const messages = [
+    { role: 'system', content: 'You are a senior data analyst. Return ONLY valid JSON with no markdown.' },
+    {
+      role: 'user',
+      content: `Analyze this dataset and return a smart overview.
+
+Dataset columns: ${schema}
+Sample rows:
+${sample}
+
+Return exactly this JSON:
+{
+  "headline": "One punchy sentence including a specific number, %, or multiplier. Lead with the strongest finding. Example: 'Electronics revenue is 2.3× higher than any other category.'",
+  "insights": [
+    "Key insight 1 — different angle from headline",
+    "Key insight 2 — another metric or pattern",
+    "Key insight 3 — trend, outlier, or comparison"
+  ],
+  "questions": [
+    "Why is [X] the highest?",
+    "What drives [Y] over time?",
+    "How does [A] compare to [B]?"
+  ]
+}
+
+Rules:
+- headline: 1 sentence, must include at least one concrete number from the data
+- insights: exactly 3, each a different angle (trend, comparison, distribution)
+- questions: exactly 3 starting with Why/What/How — make them feel like a curious analyst wrote them
+- Base all values on the actual sample data, not guesses`,
+    },
+  ]
+  const raw = await queryLLM(messages, userKey)
+  return JSON.parse(raw)
+}
+
+async function detectAnomalies(columns, rows, userKey) {
+  const numCols = columns.filter(c => c.type === 'numeric').slice(0, 6)
+  if (!numCols.length) return []
+  const stats = numCols.map(col => {
+    const vals = rows.map(r => Number(r[col.name])).filter(v => !isNaN(v))
+    if (!vals.length) return null
+    const sorted = [...vals].sort((a, b) => a - b)
+    const q1 = sorted[Math.floor(sorted.length * 0.25)]
+    const q3 = sorted[Math.floor(sorted.length * 0.75)]
+    const iqr = q3 - q1
+    const nullCount = rows.filter(r => r[col.name] === '' || r[col.name] === null || r[col.name] === undefined).length
+    const negCount = vals.filter(v => v < 0).length
+    return { col: col.name, min: sorted[0], max: sorted[sorted.length - 1], q1, q3, iqr, nullCount, negCount, total: rows.length }
+  }).filter(Boolean)
+  const messages = [
+    { role: 'system', content: 'You are a data quality analyst. Return ONLY valid JSON.' },
+    {
+      role: 'user',
+      content: `Review these column statistics and identify data quality issues (outliers, nulls, anomalies, suspicious values). Only flag real issues.
+
+Stats: ${JSON.stringify(stats)}
+
+Return: {"anomalies": [{"column": "col name", "issue": "short label", "detail": "one sentence detail", "severity": "high"|"medium"|"low"}]}
+If no issues found, return: {"anomalies": []}`,
+    },
+  ]
+  try {
+    const raw = await queryLLM(messages, userKey)
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed.anomalies) ? parsed.anomalies : []
+  } catch { return [] }
+}
+
+async function generateReport(columns, rows, userKey) {
+  const schema = columns.map(c => `${c.name} (${c.type})`).join(', ')
+  const sample = rows.slice(0, 6).map(r => JSON.stringify(r)).join('\n')
+  const messages = [
+    { role: 'system', content: 'You are a data visualization expert. Return ONLY valid JSON.' },
+    {
+      role: 'user',
+      content: `Generate a 4-chart dashboard report for this dataset.
+
+Schema: ${schema}
+Sample rows:
+${sample}
+
+Return:
+{
+  "narrative": "2-3 sentence executive summary of key findings",
+  "charts": [
+    {"chartType": "bar"|"line"|"area"|"pie", "title": "...", "xAxis": "col", "yAxis": "col", "aggregation": "sum"|"avg"|"count"|"none", "insight": "one sentence"}
+  ]
+}
+Use EXACT column names. Return exactly 4 charts covering different aspects of the data.`,
+    },
+  ]
+  const raw = await queryLLM(messages, userKey)
+  return JSON.parse(raw)
 }
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -590,21 +891,63 @@ function HeatmapChart({ data, config, columns }) {
   )
 }
 
+// ─── Forecast & Trend helpers ─────────────────────────────────────────────────
+
+function buildForecast(data, xKey, yKey, periods) {
+  if (!data.length || periods <= 0) return []
+  const nums = data.map(d => Number(d[yKey])).filter(v => !isNaN(v))
+  if (nums.length < 2) return []
+  // Simple linear extrapolation from last two values
+  const n = nums.length
+  const last = nums[n - 1]
+  const slope = (nums[n - 1] - nums[Math.max(0, n - Math.min(n, 6))]) / Math.min(n - 1, 5)
+  const lastX = data[data.length - 1][xKey]
+  const result = []
+  for (let i = 1; i <= periods; i++) {
+    result.push({ [xKey]: `${lastX}+${i}`, [yKey]: Math.max(0, last + slope * i), _forecast: true })
+  }
+  return result
+}
+
+function buildTrendPoints(data, xKey, yKey) {
+  const pts = data.map((d, i) => [i, Number(d[yKey])]).filter(([, y]) => !isNaN(y))
+  if (pts.length < 2) return []
+  const n = pts.length
+  const sumX = pts.reduce((s, [x]) => s + x, 0)
+  const sumY = pts.reduce((s, [, y]) => s + y, 0)
+  const sumXY = pts.reduce((s, [x, y]) => s + x * y, 0)
+  const sumXX = pts.reduce((s, [x]) => s + x * x, 0)
+  const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX || 1)
+  const intercept = (sumY - slope * sumX) / n
+  return [
+    { [xKey]: data[0][xKey], _trend: intercept },
+    { [xKey]: data[n - 1][xKey], _trend: intercept + slope * (n - 1) },
+  ]
+}
+
 // ─── Chart Renderer ───────────────────────────────────────────────────────────
 
-function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.datadropai, showAvgLine = false }) {
+function ChartRenderer({
+  config, data, columns, height = 420,
+  colors = PALETTES.datadropai,
+  showAvgLine = false,
+  showDataLabels = false,
+  showTrendLine = false,
+  forecastPeriods = 0,
+  showDualYAxis = false,
+  stackedBar = false,
+}) {
   const { chartType, xAxis, yAxis, groupBy } = config
   const yAxes = Array.isArray(yAxis) ? yAxis : [yAxis].filter(Boolean)
   const ax   = { stroke: 'var(--ln2)', tick: { fill: 'var(--t3)', fontSize: 11 } }
-  const mg   = { top: 8, right: 24, bottom: 8, left: 12 }
+  const mg   = { top: 8, right: showDualYAxis ? 48 : 24, bottom: 8, left: 12 }
   const grid = <CartesianGrid strokeDasharray="3 3" stroke="var(--ln)" />
   const leg  = <Legend wrapperStyle={{ color: 'var(--t3)', fontSize: 11 }} />
-  // Shared animation props — snappy ease-out feels responsive without being jarring
   const barAnim  = { isAnimationActive: true, animationDuration: 500, animationEasing: 'ease-out' }
   const lineAnim = { isAnimationActive: true, animationDuration: 700, animationEasing: 'ease-in-out' }
 
-  // Average reference line — computed across first yAxis
-  const _yKey = Array.isArray(yAxes) ? yAxes[0] : yAxes
+  // Average reference line
+  const _yKey = yAxes[0]
   const _yNums = showAvgLine && _yKey ? data.map(d => Number(d[_yKey])).filter(v => !isNaN(v)) : []
   const avgVal = _yNums.length ? _yNums.reduce((a, b) => a + b, 0) / _yNums.length : null
   const avgLine = showAvgLine && avgVal !== null
@@ -612,8 +955,20 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
         label={{ value: `avg ${fmtTick(avgVal)}`, position: 'insideTopRight', fontSize: 9, fill: 'var(--afg)', dy: -4 }} />
     : null
 
+  // Data label renderer (shared)
+  function renderLabel({ x, y, width, height: h, value }) {
+    if (!showDataLabels || value == null) return null
+    const isH = h > width
+    return (
+      <text x={isH ? x + width + 4 : x + width / 2} y={isH ? y + h / 2 + 4 : y - 4}
+        textAnchor={isH ? 'start' : 'middle'} fill="var(--t3)" fontSize={9}>
+        {fmtTick(value)}
+      </text>
+    )
+  }
+
   if (chartType === 'bar') {
-    const isH = data.length > 9
+    const isH = !stackedBar && data.length > 9
     if (groupBy) {
       const { groups, pivoted } = pivotGroupBy(data, xAxis, groupBy, yAxes[0])
       return (
@@ -625,7 +980,13 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
               : (<><XAxis dataKey={xAxis} {...ax} /><YAxis {...ax} tickFormatter={fmtTick} /></>)}
             <Tooltip content={<CustomTooltip />} />
             {leg}
-            {groups.map((g, i) => <Bar key={g} dataKey={g} fill={colors[i % colors.length]} radius={isH ? [0,3,3,0] : [3,3,0,0]} {...barAnim} />)}
+            {groups.map((g, i) => (
+              <Bar key={g} dataKey={g} fill={colors[i % colors.length]}
+                radius={stackedBar ? 0 : (isH ? [0,3,3,0] : [3,3,0,0])}
+                stackId={stackedBar ? 'stack' : undefined} {...barAnim}>
+                {showDataLabels && <LabelList content={renderLabel} />}
+              </Bar>
+            ))}
             {avgLine}
           </BarChart>
         </ResponsiveContainer>
@@ -640,7 +1001,13 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
             : (<><XAxis dataKey={xAxis} {...ax} /><YAxis {...ax} tickFormatter={fmtTick} /></>)}
           <Tooltip content={<CustomTooltip />} />
           {leg}
-          {yAxes.map((col, i) => <Bar key={col} dataKey={col} fill={colors[i % colors.length]} radius={isH ? [0,3,3,0] : [3,3,0,0]} {...barAnim} />)}
+          {yAxes.map((col, i) => (
+            <Bar key={col} dataKey={col} fill={colors[i % colors.length]}
+              radius={stackedBar ? 0 : (isH ? [0,3,3,0] : [3,3,0,0])}
+              stackId={stackedBar ? 'stack' : undefined} {...barAnim}>
+              {showDataLabels && <LabelList content={renderLabel} />}
+            </Bar>
+          ))}
           {avgLine}
         </BarChart>
       </ResponsiveContainer>
@@ -651,9 +1018,14 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
     const { pivoted, groups: grps } = groupBy ? pivotGroupBy(data, xAxis, groupBy, yAxes[0]) : {}
     const renderData = groupBy ? pivoted : data
     const keys = groupBy ? grps : yAxes
+    const forecast = !groupBy && forecastPeriods > 0
+      ? buildForecast(data, xAxis, yAxes[0], forecastPeriods)
+      : []
+    const allData = [...renderData, ...forecast]
+    const trendPts = showTrendLine && !groupBy ? buildTrendPoints(renderData, xAxis, yAxes[0]) : []
     return (
       <ResponsiveContainer width="100%" height={height}>
-        <LineChart data={renderData} margin={mg}>
+        <LineChart data={allData} margin={mg}>
           {grid}
           <XAxis dataKey={xAxis} {...ax} />
           <YAxis {...ax} tickFormatter={fmtTick} />
@@ -664,6 +1036,19 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
               strokeWidth={2} dot={data.length < 40 ? { r: 2.5, fill: colors[i % colors.length] } : false}
               activeDot={{ r: 5 }} {...lineAnim} />
           ))}
+          {forecast.length > 0 && (
+            <Line dataKey={yAxes[0]} data={[...renderData.slice(-1), ...forecast]}
+              stroke={colors[0]} strokeWidth={1.5} strokeDasharray="5 3" dot={false}
+              isAnimationActive={false} legendType="none" />
+          )}
+          {trendPts.length === 2 && (
+            <ReferenceLine
+              segment={[
+                { x: trendPts[0][xAxis], y: trendPts[0]._trend },
+                { x: trendPts[1][xAxis], y: trendPts[1]._trend },
+              ]}
+              stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="4 3" />
+          )}
           {avgLine}
         </LineChart>
       </ResponsiveContainer>
@@ -671,9 +1056,12 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
   }
 
   if (chartType === 'area') {
+    const forecast = forecastPeriods > 0 ? buildForecast(data, xAxis, yAxes[0], forecastPeriods) : []
+    const allData = [...data, ...forecast]
+    const trendPts = showTrendLine ? buildTrendPoints(data, xAxis, yAxes[0]) : []
     return (
       <ResponsiveContainer width="100%" height={height}>
-        <AreaChart data={data} margin={mg}>
+        <AreaChart data={allData} margin={mg}>
           <defs>
             {yAxes.map((_, i) => (
               <linearGradient key={i} id={`ag${i}`} x1="0" y1="0" x2="0" y2="1">
@@ -691,6 +1079,19 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
             <Area key={col} type="monotone" dataKey={col}
               stroke={colors[i % colors.length]} fill={`url(#ag${i})`} strokeWidth={2} {...lineAnim} />
           ))}
+          {forecast.length > 0 && (
+            <Area dataKey={yAxes[0]} data={[...data.slice(-1), ...forecast]}
+              stroke={colors[0]} fill="none" strokeWidth={1.5} strokeDasharray="5 3"
+              isAnimationActive={false} legendType="none" dot={false} />
+          )}
+          {trendPts.length === 2 && (
+            <ReferenceLine
+              segment={[
+                { x: trendPts[0][xAxis], y: trendPts[0]._trend },
+                { x: trendPts[1][xAxis], y: trendPts[1]._trend },
+              ]}
+              stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="4 3" />
+          )}
           {avgLine}
         </AreaChart>
       </ResponsiveContainer>
@@ -698,14 +1099,23 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
   }
 
   if (chartType === 'scatter') {
+    const trendPts = showTrendLine ? buildTrendPoints(data, xAxis, yAxes[0]) : []
     return (
       <ResponsiveContainer width="100%" height={height}>
         <ScatterChart margin={mg}>
           {grid}
-          <XAxis dataKey={xAxis} {...ax} name={xAxis} tickFormatter={fmtTick} />
+          <XAxis dataKey={xAxis} type="number" {...ax} name={xAxis} tickFormatter={fmtTick} />
           <YAxis dataKey={yAxes[0]} {...ax} name={yAxes[0]} tickFormatter={fmtTick} />
           <Tooltip contentStyle={TT} cursor={{ strokeDasharray: '3 3', stroke: 'var(--ln3)' }} />
           <Scatter data={data} fill={colors[0]} fillOpacity={0.75} />
+          {trendPts.length === 2 && (
+            <ReferenceLine
+              segment={[
+                { x: Number(trendPts[0][xAxis]), y: trendPts[0]._trend },
+                { x: Number(trendPts[1][xAxis]), y: trendPts[1]._trend },
+              ]}
+              stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="4 3" />
+          )}
         </ScatterChart>
       </ResponsiveContainer>
     )
@@ -752,19 +1162,41 @@ function ChartRenderer({ config, data, columns, height = 360, colors = PALETTES.
     return <HeatmapChart data={data} config={config} columns={columns} />
   }
 
+  if (chartType === 'funnel') {
+    return (
+      <ResponsiveContainer width="100%" height={height}>
+        <FunnelChart margin={mg}>
+          <Tooltip content={<CustomTooltip />} />
+          <Funnel dataKey={yAxes[0]} data={data} isAnimationActive={true} animationDuration={700}>
+            {data.map((_, i) => <Cell key={i} fill={colors[i % colors.length]} />)}
+            {showDataLabels && (
+              <LabelList position="right" fill="var(--t3)" stroke="none" dataKey={xAxis} fontSize={11} />
+            )}
+          </Funnel>
+        </FunnelChart>
+      </ResponsiveContainer>
+    )
+  }
+
   if (chartType === 'composed') {
     return (
       <ResponsiveContainer width="100%" height={height}>
         <ComposedChart data={data} margin={mg}>
           {grid}
           <XAxis dataKey={xAxis} {...ax} />
-          <YAxis {...ax} tickFormatter={fmtTick} />
+          <YAxis yAxisId="left" {...ax} tickFormatter={fmtTick} />
+          {showDualYAxis && yAxes.length > 1 && (
+            <YAxis yAxisId="right" orientation="right" {...ax} tickFormatter={fmtTick} />
+          )}
           <Tooltip content={<CustomTooltip />} />
           {leg}
           {yAxes.map((col, i) =>
             i === 0
-              ? <Bar key={col} dataKey={col} fill={colors[0]} radius={[3,3,0,0]} fillOpacity={0.85} {...barAnim} />
-              : <Line key={col} type="monotone" dataKey={col} stroke={colors[i % colors.length]} strokeWidth={2} dot={false} {...lineAnim} />
+              ? <Bar key={col} yAxisId="left" dataKey={col} fill={colors[0]} radius={[3,3,0,0]} fillOpacity={0.85} {...barAnim}>
+                  {showDataLabels && <LabelList content={renderLabel} />}
+                </Bar>
+              : <Line key={col} yAxisId={showDualYAxis && i === 1 ? 'right' : 'left'}
+                  type="monotone" dataKey={col} stroke={colors[i % colors.length]} strokeWidth={2} dot={false} {...lineAnim} />
           )}
           {avgLine}
         </ComposedChart>
@@ -837,6 +1269,59 @@ function PalettePicker({ palette, onPalette }) {
               {palette === k && <span className="ml-auto text-[var(--afg)] text-[10px]">✓</span>}
             </button>
           ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── API Key Popover ──────────────────────────────────────────────────────────
+
+function ApiKeyPopover({ apiKey, onApiKey }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    function close(e) { if (!ref.current?.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [open])
+
+  const hasKey = apiKey.trim().length > 0
+
+  return (
+    <div className="relative" ref={ref}>
+      <button onClick={() => setOpen(o => !o)} title="Groq API key"
+        className={`flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1.5 rounded-lg border transition-all ${
+          hasKey
+            ? 'bg-[#10b981]/8 border-[#10b981]/20 text-[#10b981]'
+            : 'bg-[var(--sf2)] border-[var(--ln2)] text-[var(--t4)] hover:text-[var(--t2)] hover:border-[var(--ln3)]'
+        }`}>
+        <svg width="11" height="11" viewBox="0 0 14 14" fill="none">
+          <circle cx="5.5" cy="5.5" r="4" stroke="currentColor" strokeWidth="1.4"/>
+          <path d="M8.5 8.5l3.5 3.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+          <path d="M10 11.5l1-1" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+        {hasKey ? 'Key ✓' : 'Key'}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1.5 bg-[var(--sf3)] border border-[var(--ln2)] rounded-xl p-3.5 z-40 w-[260px]"
+          style={{ boxShadow: 'var(--shadow-lg)' }}>
+          <p className="text-[11px] font-semibold text-[var(--t2)] mb-2.5">Groq API key</p>
+          <input
+            type="password"
+            placeholder="gsk_…"
+            value={apiKey}
+            autoFocus
+            onChange={e => onApiKey(e.target.value)}
+            className="w-full bg-[var(--sf)] border border-[var(--ln2)] focus:border-[#6366f1]/50 rounded-lg px-3 py-2 text-[12px] font-mono text-[var(--t1)] placeholder:text-[var(--t4)] focus:outline-none transition-colors"
+          />
+          <p className="text-[10px] text-[var(--t4)] mt-2.5 leading-relaxed">
+            Optional — uses a shared rate-limited key by default.{' '}
+            <a href="https://console.groq.com" target="_blank" rel="noopener noreferrer"
+              className="text-[var(--afg)] hover:underline">Get a free key →</a>
+          </p>
         </div>
       )}
     </div>
@@ -947,22 +1432,38 @@ function StatsStrip({ rows, columns }) {
 
 const TABLE_ROW_LIMIT = 500
 
-function DataTable({ data }) {
+function DataTable({ data, heatmap = false }) {
   const [sortCol, setSortCol] = useState(null)
   const [sortDir, setSortDir] = useState('asc')
   const [search, setSearch] = useState('')
   const [showAll, setShowAll] = useState(false)
+  const [showHeatmap, setShowHeatmap] = useState(heatmap)
 
   if (!data.length) return null
   const cols = Object.keys(data[0]).filter(k => !k.startsWith('_'))
 
+  // Compute per-column min/max for heatmap coloring (numeric cols only)
+  const colRanges = {}
+  if (showHeatmap) {
+    cols.forEach(col => {
+      const nums = data.map(r => Number(r[col])).filter(v => !isNaN(v))
+      if (nums.length > 1) colRanges[col] = { min: Math.min(...nums), max: Math.max(...nums) }
+    })
+  }
+
+  function cellStyle(col, val) {
+    if (!showHeatmap) return {}
+    const range = colRanges[col]
+    if (!range) return {}
+    const n = Number(val)
+    if (isNaN(n)) return {}
+    const t = (n - range.min) / (range.max - range.min || 1)
+    return { backgroundColor: `rgba(99,102,241,${(t * 0.35).toFixed(2)})`, color: t > 0.6 ? 'var(--t1)' : undefined }
+  }
+
   function handleSort(col) {
-    if (sortCol === col) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortCol(col)
-      setSortDir('asc')
-    }
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortCol(col); setSortDir('asc') }
   }
 
   const filtered = search
@@ -985,18 +1486,29 @@ function DataTable({ data }) {
 
   return (
     <div className="space-y-2">
-      <div className="relative">
-        <input
-          type="text"
-          placeholder="Search rows…"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          className="w-full bg-[var(--bg)] border border-[var(--ln2)] rounded-lg px-3 py-2 text-[12px] text-[var(--t2)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/40 transition-colors pr-8"
-        />
-        {search && (
-          <button onClick={() => setSearch('')}
-            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--t4)] hover:text-[var(--t2)] transition-colors text-[11px]">✕</button>
-        )}
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <input
+            type="text"
+            placeholder="Search rows…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="w-full bg-[var(--bg)] border border-[var(--ln2)] rounded-lg px-3 py-2 text-[12px] text-[var(--t2)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/40 transition-colors pr-8"
+          />
+          {search && (
+            <button onClick={() => setSearch('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--t4)] hover:text-[var(--t2)] transition-colors text-[11px]">✕</button>
+          )}
+        </div>
+        <button onClick={() => setShowHeatmap(h => !h)}
+          title="Toggle heatmap coloring"
+          className={`shrink-0 text-[11px] px-2.5 py-1.5 rounded-lg border transition-all ${
+            showHeatmap
+              ? 'bg-[#6366f1]/12 border-[#6366f1]/25 text-[var(--afg)]'
+              : 'border-[var(--ln2)] text-[var(--t4)] hover:text-[var(--t2)]'
+          }`}>
+          Heatmap
+        </button>
       </div>
       <div className="overflow-x-auto rounded-xl border border-[var(--ln)]">
         <table className="text-[12px] w-full">
@@ -1023,7 +1535,8 @@ function DataTable({ data }) {
             ) : displayed.map((row, i) => (
               <tr key={i} className="border-b border-[var(--ln)] last:border-0 hover:bg-[var(--sf2)] transition-colors">
                 {cols.map(col => (
-                  <td key={col} className="px-3 py-2 text-[var(--t2)] whitespace-nowrap max-w-[200px] truncate">
+                  <td key={col} style={cellStyle(col, row[col])}
+                    className="px-3 py-2 text-[var(--t2)] whitespace-nowrap max-w-[200px] truncate transition-colors">
                     {row[col] ?? '—'}
                   </td>
                 ))}
@@ -1045,13 +1558,404 @@ function DataTable({ data }) {
   )
 }
 
+// ─── Dataset Profile ──────────────────────────────────────────────────────────
+
+function DatasetProfile({ profile, loading }) {
+  const [open, setOpen] = useState(true)
+  if (!loading && !profile) return null
+  const roleColor = { metric: '#6366f1', dimension: '#10b981', id: '#71717a', date: '#f59e0b' }
+  const roleBg    = { metric: 'bg-[#6366f1]/10', dimension: 'bg-[#10b981]/10', id: 'bg-[#71717a]/10', date: 'bg-[#f59e0b]/10' }
+  return (
+    <div className="bg-[var(--sf)] border border-[var(--ln)] rounded-xl overflow-hidden">
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center justify-between px-4 py-2.5 text-[12px] text-[var(--t3)] hover:text-[var(--t1)] transition-colors">
+        <span className="flex items-center gap-2 font-medium">
+          <span className="text-[var(--afg)]">✦</span> What this data measures
+        </span>
+        <span className="text-[10px] text-[var(--t5)]">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-[var(--ln)] px-4 py-3 space-y-3">
+          {loading ? (
+            <div className="animate-pulse space-y-2">
+              <div className="h-3 bg-[var(--sf2)] rounded w-3/4" />
+              <div className="flex gap-1.5 flex-wrap">
+                {[80, 64, 96, 72].map(w => <div key={w} style={{ width: w }} className="h-6 bg-[var(--sf2)] rounded-full" />)}
+              </div>
+            </div>
+          ) : (
+            <>
+              {profile.summary && (
+                <p className="text-[12px] text-[var(--t2)] leading-relaxed">{profile.summary}</p>
+              )}
+              {Array.isArray(profile.columns) && (
+                <div className="flex flex-wrap gap-1.5">
+                  {profile.columns.map(col => (
+                    <span key={col.name} title={col.description}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] border border-transparent ${roleBg[col.role] || 'bg-[var(--sf2)]'} cursor-default`}>
+                      <span style={{ color: roleColor[col.role] || 'var(--t4)' }} className="text-[9px] font-bold uppercase">
+                        {col.role}
+                      </span>
+                      <span className="text-[var(--t2)]">{col.name}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-center gap-3 pt-0.5">
+                {Object.entries({ metric: '#6366f1', dimension: '#10b981', date: '#f59e0b', id: '#71717a' }).map(([role, color]) => (
+                  <span key={role} className="flex items-center gap-1 text-[10px] text-[var(--t5)]">
+                    <span style={{ background: color }} className="w-1.5 h-1.5 rounded-full inline-block" />
+                    {role}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Anomaly Panel ────────────────────────────────────────────────────────────
+
+function AnomalyPanel({ anomalies, loading }) {
+  const [open, setOpen] = useState(false)
+  if (!loading && !anomalies.length) return null
+  const sevColor = { high: 'text-red-400', medium: 'text-amber-400', low: 'text-[var(--t4)]' }
+  const sevBg    = { high: 'bg-red-400/10 border-red-400/20', medium: 'bg-amber-400/10 border-amber-400/20', low: 'bg-[var(--sf2)] border-[var(--ln)]' }
+  return (
+    <div className="bg-[var(--sf)] border border-[var(--ln)] rounded-xl overflow-hidden">
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center justify-between px-4 py-2.5 text-[12px] hover:text-[var(--t1)] transition-colors">
+        <span className="flex items-center gap-2 font-medium text-[var(--t3)]">
+          <span className={loading ? 'text-[var(--t5)]' : anomalies.some(a => a.severity === 'high') ? 'text-red-400' : 'text-amber-400'}>⚠</span>
+          Data quality
+          {!loading && anomalies.length > 0 && (
+            <span className="bg-amber-400/15 text-amber-400 text-[10px] px-1.5 py-0.5 rounded-full font-medium">
+              {anomalies.length} issue{anomalies.length !== 1 ? 's' : ''}
+            </span>
+          )}
+        </span>
+        <span className="text-[10px] text-[var(--t5)]">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-[var(--ln)] px-4 py-3 space-y-2">
+          {loading ? (
+            <div className="animate-pulse space-y-2">
+              {[1,2].map(i => <div key={i} className="h-10 bg-[var(--sf2)] rounded-lg" />)}
+            </div>
+          ) : anomalies.map((a, i) => (
+            <div key={i} className={`flex items-start gap-3 px-3 py-2.5 rounded-lg border ${sevBg[a.severity] || sevBg.low}`}>
+              <span className={`text-[10px] font-bold uppercase shrink-0 mt-0.5 ${sevColor[a.severity] || 'text-[var(--t4)]'}`}>
+                {a.severity}
+              </span>
+              <div className="min-w-0">
+                <p className="text-[11px] font-medium text-[var(--t2)]">{a.column} — {a.issue}</p>
+                <p className="text-[11px] text-[var(--t4)] mt-0.5 leading-relaxed">{a.detail}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Filter Panel ─────────────────────────────────────────────────────────────
+
+function FilterPanel({ columns, rows, filters, onFilters, onClose }) {
+  const catCols = columns.filter(c => c.type === 'categorical').slice(0, 8)
+  return (
+    <div className="bg-[var(--sf)] border border-[var(--ln2)] rounded-xl p-4 space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-[12px] font-medium text-[var(--t2)]">Column filters</p>
+        <button onClick={onClose} className="text-[11px] text-[var(--t4)] hover:text-[var(--t2)] transition-colors">✕ Close</button>
+      </div>
+      {catCols.length === 0 && (
+        <p className="text-[12px] text-[var(--t4)]">No categorical columns to filter.</p>
+      )}
+      {catCols.map(col => {
+        const counts = {}
+        rows.forEach(r => { const v = String(r[col.name] ?? ''); counts[v] = (counts[v] || 0) + 1 })
+        const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 20)
+        const excluded = filters[col.name] || new Set()
+        return (
+          <div key={col.name} className="space-y-1.5">
+            <p className="text-[11px] font-medium text-[var(--t3)]">{col.name}</p>
+            <div className="flex flex-wrap gap-1">
+              {top.map(([val]) => {
+                const isExcluded = excluded.has(val)
+                return (
+                  <button key={val}
+                    onClick={() => {
+                      const next = new Set(excluded)
+                      isExcluded ? next.delete(val) : next.add(val)
+                      onFilters({ ...filters, [col.name]: next })
+                    }}
+                    className={`text-[11px] px-2.5 py-1 rounded-full border transition-all ${
+                      isExcluded
+                        ? 'line-through border-[var(--ln)] text-[var(--t5)] bg-[var(--sf2)]'
+                        : 'border-[var(--ln2)] text-[var(--t3)] hover:border-[var(--ln3)] hover:text-[var(--t1)]'
+                    }`}>
+                    {val}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })}
+      <button onClick={() => onFilters({})}
+        className="text-[11px] text-[var(--t4)] hover:text-red-400 transition-colors">
+        Clear all filters
+      </button>
+    </div>
+  )
+}
+
+// ─── Workspace Modal ──────────────────────────────────────────────────────────
+
+function WorkspaceModal({ workspaces, onSave, onLoad, onDelete, onClose }) {
+  const [name, setName] = useState('')
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-[var(--sf)] border border-[var(--ln2)] rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl space-y-5"
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <h3 className="text-[14px] font-semibold text-[var(--t1)]">Saved workspaces</h3>
+          <button onClick={onClose} className="text-[var(--t4)] hover:text-[var(--t1)] transition-colors">✕</button>
+        </div>
+        <div className="flex gap-2">
+          <input type="text" value={name} onChange={e => setName(e.target.value)}
+            placeholder="Workspace name…"
+            onKeyDown={e => { if (e.key === 'Enter' && name.trim()) { onSave(name.trim()); setName('') } }}
+            className="flex-1 bg-[var(--bg)] border border-[var(--ln2)] rounded-lg px-3 py-2 text-[12px] text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/50 transition-colors" />
+          <button onClick={() => { if (name.trim()) { onSave(name.trim()); setName('') } }} disabled={!name.trim()}
+            className="bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 text-white text-[12px] px-4 py-2 rounded-lg transition-colors whitespace-nowrap">
+            Save
+          </button>
+        </div>
+        {workspaces.length === 0 ? (
+          <p className="text-[12px] text-[var(--t5)] text-center py-4">No saved workspaces yet.</p>
+        ) : (
+          <div className="space-y-1.5 max-h-60 overflow-y-auto">
+            {workspaces.map((ws, i) => (
+              <div key={i} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg hover:bg-[var(--sf2)] transition-colors group">
+                <div className="min-w-0">
+                  <p className="text-[12px] font-medium text-[var(--t2)] truncate">{ws.name}</p>
+                  <p className="text-[10px] text-[var(--t5)]">{ws.cols} cols · {ws.pins?.length ?? 0} pins</p>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button onClick={() => onLoad(ws)}
+                    className="text-[11px] text-[var(--afg)] hover:underline transition-colors px-2">Load</button>
+                  <button onClick={() => onDelete(i)}
+                    className="text-[11px] text-[var(--t5)] hover:text-red-400 transition-colors px-1">✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Mini chart helpers (shared by LandingPage + DataInput) ───────────────────
+
+function MiniBar({ values, color = '#6366f1' }) {
+  const max = Math.max(...values) || 1
+  const W = 64, H = 24, n = values.length
+  const gap = 2, bw = (W - gap * (n - 1)) / n
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+      {values.map((v, i) => {
+        const h = Math.max(2, (v / max) * (H - 1))
+        return <rect key={i} x={i * (bw + gap)} y={H - h} width={bw} height={h}
+          rx={1.5} fill={color} fillOpacity={0.45 + (v / max) * 0.45} />
+      })}
+    </svg>
+  )
+}
+
+function MiniLine({ values, color = '#10b981' }) {
+  const min = Math.min(...values), max = Math.max(...values), range = max - min || 1
+  const W = 64, H = 24
+  const pts = values.map((v, i) => [
+    (i / (values.length - 1)) * W,
+    H - 2 - ((v - min) / range) * (H - 5),
+  ])
+  const d = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ')
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+      <path d={d} fill="none" stroke={color} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+// ─── Alert Panel ──────────────────────────────────────────────────────────────
+
+const ALERT_OPS  = ['>', '<', '>=', '<=', '=']
+const ALERT_AGGS = [
+  { value: 'any',  label: 'Any row' },
+  { value: 'avg',  label: 'Average' },
+  { value: 'max',  label: 'Maximum' },
+  { value: 'min',  label: 'Minimum' },
+]
+
+function AlertPanel({ alerts, columns, triggeredIds, onAdd, onRemove, onToggle, onClose }) {
+  const numCols = columns.filter(c => c.type === 'numeric')
+  const [col,   setCol]   = useState(numCols[0]?.name || '')
+  const [op,    setOp]    = useState('>')
+  const [val,   setVal]   = useState('')
+  const [agg,   setAgg]   = useState('avg')
+  const [label, setLabel] = useState('')
+
+  function submit() {
+    if (!col || !val.trim() || !label.trim()) return
+    onAdd({ label: label.trim(), column: col, op, value: Number(val), aggregate: agg, enabled: true })
+    setLabel(''); setVal('')
+  }
+
+  const sel = 'bg-[var(--sf)] border border-[var(--ln2)] rounded-lg px-2 py-1.5 text-[12px] text-[var(--t2)] focus:outline-none cursor-pointer transition-colors'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-[var(--sf)] border border-[var(--ln2)] rounded-2xl p-5 w-full max-w-md mx-4 shadow-2xl space-y-5"
+        onClick={e => e.stopPropagation()}>
+
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-[14px] font-semibold text-[var(--t1)]">Alerts</h3>
+            <p className="text-[11px] text-[var(--t4)] mt-0.5">Get notified when a threshold is crossed</p>
+          </div>
+          <button onClick={onClose} className="text-[var(--t4)] hover:text-[var(--t2)] transition-colors">✕</button>
+        </div>
+
+        {/* Add form */}
+        {numCols.length > 0 ? (
+          <div className="bg-[var(--sf2)] border border-[var(--ln)] rounded-xl p-3.5 space-y-3">
+            <p className="text-[11px] font-semibold text-[var(--t3)] uppercase tracking-wider">New alert</p>
+            <input value={label} onChange={e => setLabel(e.target.value)} placeholder="Label, e.g. Revenue drops"
+              className="w-full bg-[var(--bg)] border border-[var(--ln2)] rounded-lg px-3 py-1.5 text-[12px] text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/50 transition-colors" />
+            <div className="flex gap-2 flex-wrap">
+              <select value={agg} onChange={e => setAgg(e.target.value)} className={sel}>
+                {ALERT_AGGS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+              </select>
+              <select value={col} onChange={e => setCol(e.target.value)} className={`${sel} flex-1 min-w-0`}>
+                {numCols.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+              </select>
+              <select value={op} onChange={e => setOp(e.target.value)} className={sel}>
+                {ALERT_OPS.map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+              <input type="number" value={val} onChange={e => setVal(e.target.value)} placeholder="value"
+                className={`${sel} w-24 font-mono`} />
+            </div>
+            <button onClick={submit} disabled={!col || !val.trim() || !label.trim()}
+              className="w-full bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 text-white text-[12px] font-semibold py-2 rounded-lg transition-colors">
+              Add alert
+            </button>
+          </div>
+        ) : (
+          <p className="text-[12px] text-[var(--t4)] text-center py-2">Load a dataset with numeric columns to define alerts.</p>
+        )}
+
+        {/* Alert list */}
+        {alerts.length > 0 && (
+          <div className="space-y-2 max-h-56 overflow-y-auto">
+            {alerts.map(a => {
+              const fired = triggeredIds.includes(a.id)
+              return (
+                <div key={a.id} className={`flex items-center gap-3 px-3 py-2.5 rounded-xl border transition-all ${
+                  fired ? 'bg-red-400/8 border-red-400/25' : 'bg-[var(--sf2)] border-[var(--ln)]'
+                }`}>
+                  <button onClick={() => onToggle(a.id)}
+                    className={`w-8 h-4 rounded-full transition-colors shrink-0 ${a.enabled ? 'bg-[#6366f1]' : 'bg-[var(--ln3)]'}`}>
+                    <span className={`block w-3 h-3 rounded-full bg-white mx-0.5 transition-transform ${a.enabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </button>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[12px] font-medium text-[var(--t1)] truncate">{a.label}</p>
+                    <p className="text-[10px] text-[var(--t5)]">{ALERT_AGGS.find(x=>x.value===a.aggregate)?.label} of {a.column} {a.op} {a.value}</p>
+                  </div>
+                  {fired && <span className="text-[10px] font-bold text-red-400 shrink-0">FIRED</span>}
+                  <button onClick={() => onRemove(a.id)} className="text-[var(--t5)] hover:text-red-400 transition-colors shrink-0 text-[11px]">✕</button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+        {alerts.length === 0 && numCols.length > 0 && (
+          <p className="text-[12px] text-[var(--t5)] text-center pb-1">No alerts defined yet.</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Onboarding Modal ─────────────────────────────────────────────────────────
+
+const ONBOARDING_STEPS = [
+  { icon: '📂', title: 'Load your data', body: 'Drop a CSV or JSON file, paste rows directly, fetch from a URL, or try one of the built-in sample datasets.' },
+  { icon: '💬', title: 'Ask in plain English', body: 'Type any question — "Show sales by region" or "Top 10 products by revenue" — and the AI picks the right chart and axes automatically.' },
+  { icon: '⚙️', title: 'Refine without re-querying', body: 'Use the X / Y / Group / Agg dropdowns to instantly swap axes. Toggle Avg, Trend, Stack, or Forecast in one click. The Where button lets you filter rows with expressions like sales > 1000.' },
+  { icon: '📌', title: 'Build a dashboard', body: 'Pin any chart to your dashboard. Drag to reorder, add notes, then export the whole thing as a PNG or share via link.' },
+  { icon: '⌨️', title: 'Keyboard shortcuts', body: '⌘K — focus the query bar\nF — fullscreen chart\n⌘Z — undo last chart\nEsc — close/blur\n? — open this guide' },
+]
+
+function OnboardingModal({ onClose }) {
+  const [step, setStep] = useState(0)
+  const isLast = step === ONBOARDING_STEPS.length - 1
+  const s = ONBOARDING_STEPS[step]
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-[var(--sf)] border border-[var(--ln2)] rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl"
+        onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-5">
+          <div className="flex gap-1.5">
+            {ONBOARDING_STEPS.map((_, i) => (
+              <button key={i} onClick={() => setStep(i)}
+                className={`h-1.5 rounded-full transition-all ${i === step ? 'w-6 bg-[#6366f1]' : 'w-1.5 bg-[var(--ln2)] hover:bg-[var(--ln3)]'}`} />
+            ))}
+          </div>
+          <button onClick={onClose} className="text-[var(--t4)] hover:text-[var(--t2)] transition-colors text-[13px]">✕</button>
+        </div>
+        <div className="text-center space-y-3 mb-6">
+          <div className="text-3xl">{s.icon}</div>
+          <h3 className="text-[16px] font-semibold text-[var(--t1)]">{s.title}</h3>
+          <p className="text-[13px] text-[var(--t3)] leading-relaxed whitespace-pre-line">{s.body}</p>
+        </div>
+        <div className="flex gap-2">
+          {step > 0 && (
+            <button onClick={() => setStep(s => s - 1)}
+              className="flex-1 text-[13px] font-medium border border-[var(--ln2)] text-[var(--t3)] hover:text-[var(--t1)] hover:border-[var(--ln3)] px-4 py-2.5 rounded-xl transition-colors">
+              ← Back
+            </button>
+          )}
+          <button onClick={isLast ? onClose : () => setStep(s => s + 1)}
+            className="flex-1 text-[13px] font-semibold bg-[#6366f1] hover:bg-[#5254cc] text-white px-4 py-2.5 rounded-xl transition-colors">
+            {isLast ? 'Get started' : 'Next →'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Landing Page ─────────────────────────────────────────────────────────────
 
 function LandingPage({ onGetStarted, onSample, theme, onToggleTheme }) {
-  return (
-    <div className="min-h-screen bg-[var(--bg-d)] text-[var(--t1)] dot-grid">
 
-      {/* Nav */}
+  const samplePreviews = {
+    coffee:  <MiniBar  values={[8200,6100,4800,4200,3900,3600,3100,2800,2600,2200]} color="#6366f1" />,
+    stocks:  <MiniLine values={[185,182,171,165,191,210,218,226,233,229,237,243]}   color="#10b981" />,
+    olympics:<MiniBar  values={[40,40,20,18,16,15,14,13,12,12]}                     color="#f59e0b" />,
+    saas:    <MiniLine values={[12000,14500,16200,18800,21500,24200,27000,30500,34200,38000,42500,47800]} color="#6366f1" />,
+  }
+
+  return (
+    <div className="min-h-screen bg-[var(--bg-d)] text-[var(--t1)]">
+
+      {/* ── Nav ── */}
       <nav className="sticky top-0 z-20 border-b border-[var(--ln)] backdrop-blur-md"
         style={{ backgroundColor: 'var(--nav-blur)' }}>
         <div className="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
@@ -1061,131 +1965,229 @@ function LandingPage({ onGetStarted, onSample, theme, onToggleTheme }) {
           </div>
           <div className="flex items-center gap-2">
             <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-            <button
-              onClick={onGetStarted}
-              className="text-[13px] font-medium bg-[var(--t1)] text-[var(--bg)] px-4 py-1.5 rounded-lg hover:opacity-90 transition-opacity"
-            >
+            <button onClick={onGetStarted}
+              className="text-[13px] font-semibold bg-[#6366f1] hover:bg-[#5254cc] text-white px-4 py-1.5 rounded-lg transition-colors">
               Open app
             </button>
           </div>
         </div>
       </nav>
 
-      {/* Hero */}
-      <section className="relative max-w-5xl mx-auto px-6 pt-24 pb-20 text-center overflow-hidden">
-        <div className="absolute inset-0 pointer-events-none" aria-hidden="true">
-          <div style={{ position: 'absolute', top: '0%', left: '50%', transform: 'translateX(-50%)', width: 700, height: 340, borderRadius: '50%', background: 'radial-gradient(ellipse, rgba(99,102,241,0.11) 0%, transparent 70%)', filter: 'blur(40px)' }} />
-        </div>
-        <div className="inline-flex items-center gap-2 bg-[#6366f1]/10 border border-[#6366f1]/20 text-[var(--afg)] text-[12px] px-3 py-1 rounded-full mb-8 font-medium">
-          <span className="w-1.5 h-1.5 bg-[#6366f1] rounded-full inline-block" />
-          Powered by Groq — free to use
+      {/* ── Hero ── */}
+      <section className="relative overflow-hidden dot-grid">
+        {/* Ambient glows */}
+        <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+          <div style={{ position:'absolute', top:'-10%', left:'50%', transform:'translateX(-50%)', width:800, height:500, borderRadius:'50%', background:'radial-gradient(ellipse, rgba(99,102,241,0.13) 0%, transparent 65%)', filter:'blur(60px)' }} />
+          <div style={{ position:'absolute', top:'20%', right:'-5%', width:400, height:400, borderRadius:'50%', background:'radial-gradient(ellipse, rgba(245,158,11,0.07) 0%, transparent 70%)', filter:'blur(50px)' }} />
         </div>
 
-        <h1 className="text-[58px] sm:text-[76px] font-bold tracking-[-0.03em] leading-[0.92] mb-7">
-          Ask your data
-          <br />
-          <span className="text-transparent bg-clip-text bg-gradient-to-br from-[#818cf8] via-[#6366f1] to-[#4f46e5]">
-            anything.
-          </span>
-        </h1>
+        <div className="relative max-w-5xl mx-auto px-6 pt-24 pb-10 text-center">
+          {/* Badge */}
+          <div className="inline-flex items-center gap-2 bg-[#6366f1]/10 border border-[#6366f1]/18 text-[var(--afg)] text-[11px] px-3 py-1.5 rounded-full mb-10 font-semibold tracking-wide">
+            <span className="w-1.5 h-1.5 bg-[#6366f1] rounded-full inline-block animate-pulse" />
+            Powered by Groq · Free to use
+          </div>
 
-        <p className="text-[var(--t3)] text-lg sm:text-xl max-w-lg mx-auto mb-10 leading-relaxed">
-          Drop a CSV or Google Sheet. Type a question in plain English.
-          Get a chart in seconds — no code, no setup.
-        </p>
+          {/* Headline */}
+          <h1 className="text-[56px] sm:text-[80px] font-bold tracking-[-0.04em] leading-[0.9] mb-6">
+            Ask your data
+            <br />
+            <span className="text-transparent bg-clip-text bg-gradient-to-br from-[#a5b4fc] via-[#818cf8] to-[#6366f1]">
+              anything.
+            </span>
+          </h1>
 
-        <div className="flex items-center justify-center gap-3 flex-wrap">
-          <button
-            onClick={onGetStarted}
-            className="bg-[#6366f1] hover:bg-[#5254cc] text-white text-[14px] font-medium px-6 py-3 rounded-xl transition-colors"
-          >
-            Upload your data →
-          </button>
-          <button
-            onClick={() => onSample(SAMPLES[3])}
-            className="text-[14px] text-[var(--t3)] hover:text-[var(--t1)] border border-[var(--ln2)] hover:border-[var(--ln3)] px-6 py-3 rounded-xl transition-colors"
-          >
-            Try a demo
-          </button>
+          {/* Subtext */}
+          <p className="text-[var(--t3)] text-[17px] sm:text-[19px] max-w-[480px] mx-auto mb-10 leading-relaxed">
+            Drop a CSV or Google Sheet. Ask a question in plain English.
+            Get an interactive chart in seconds.
+          </p>
+
+          {/* CTAs */}
+          <div className="flex items-center justify-center gap-3 flex-wrap">
+            <button onClick={onGetStarted}
+              className="bg-[#6366f1] hover:bg-[#5254cc] text-white text-[14px] font-semibold px-7 py-3 rounded-xl transition-all"
+              style={{ boxShadow: '0 0 0 0 rgba(99,102,241,0)', transition: 'background-color 0.15s, box-shadow 0.15s' }}
+              onMouseEnter={e => e.currentTarget.style.boxShadow='0 4px 20px rgba(99,102,241,0.35)'}
+              onMouseLeave={e => e.currentTarget.style.boxShadow='none'}>
+              Upload your data →
+            </button>
+            <button onClick={() => onSample(SAMPLES[3])}
+              className="text-[14px] font-medium text-[var(--t3)] hover:text-[var(--t1)] border border-[var(--ln2)] hover:border-[var(--ln3)] bg-[var(--sf)] hover:bg-[var(--sf2)] px-7 py-3 rounded-xl transition-all">
+              Try a demo
+            </button>
+          </div>
+        </div>
+
+        {/* Product mockup */}
+        <div className="relative max-w-2xl mx-auto px-6 pb-24 mt-14">
+          <div className="bg-[var(--sf)] border border-[var(--ln2)] rounded-2xl overflow-hidden"
+            style={{ boxShadow: '0 0 0 1px rgba(99,102,241,0.08), var(--shadow-lg)' }}>
+
+            {/* Window chrome */}
+            <div className="flex items-center gap-2 px-4 py-3 border-b border-[var(--ln)] bg-[var(--sf2)]">
+              <span className="w-2.5 h-2.5 rounded-full bg-[var(--ln3)]" />
+              <span className="w-2.5 h-2.5 rounded-full bg-[var(--ln3)]" />
+              <span className="w-2.5 h-2.5 rounded-full bg-[var(--ln3)]" />
+              <div className="flex-1 mx-3 h-5 bg-[var(--sf3)] rounded-md" />
+            </div>
+
+            {/* Query row */}
+            <div className="px-4 py-3 border-b border-[var(--ln)]">
+              <div className="flex items-center gap-3 bg-[var(--sf2)] border border-[var(--ln2)] rounded-xl px-4 py-2.5">
+                <span className="text-[13px] text-[var(--t2)] flex-1 text-left">Show me MRR growth by month as a line chart</span>
+                <span className="shrink-0 bg-[#6366f1] text-white text-[11px] font-semibold px-3 py-1 rounded-lg">Ask</span>
+              </div>
+            </div>
+
+            {/* Chart area */}
+            <div className="px-5 pt-4 pb-5">
+              {/* Card header */}
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <p className="text-[13px] font-semibold text-[var(--t1)]">MRR Growth by Month</p>
+                  <span className="text-[9px] bg-[#6366f1]/10 text-[var(--afg)] px-2 py-0.5 rounded-md mt-1 inline-block font-semibold tracking-widest uppercase">Line</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] text-[var(--t4)] px-2.5 py-1 rounded-lg">Share</span>
+                  <span className="text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] text-[var(--t4)] px-2.5 py-1 rounded-lg">Pin</span>
+                </div>
+              </div>
+
+              {/* Mini line chart */}
+              <svg width="100%" viewBox="0 0 480 110" preserveAspectRatio="none" style={{ display:'block', height:110 }}>
+                {/* Grid lines */}
+                {[25, 50, 75].map(y => (
+                  <line key={y} x1={0} y1={y} x2={480} y2={y} stroke="rgba(99,102,241,0.06)" strokeWidth={1} />
+                ))}
+                {/* Area fill */}
+                <path
+                  d="M0,95 L40,88 L80,80 L120,70 L160,58 L200,46 L240,38 L280,26 L320,20 L360,14 L400,9 L440,5 L480,2 L480,105 L0,105 Z"
+                  fill="url(#mgrd)" fillOpacity="0.25" />
+                <defs>
+                  <linearGradient id="mgrd" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#6366f1" stopOpacity="0.6" />
+                    <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
+                  </linearGradient>
+                </defs>
+                {/* Line */}
+                <path
+                  d="M0,95 L40,88 L80,80 L120,70 L160,58 L200,46 L240,38 L280,26 L320,20 L360,14 L400,9 L440,5 L480,2"
+                  fill="none" stroke="#6366f1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                {/* Dot at peak */}
+                <circle cx="480" cy="2" r="3.5" fill="#6366f1" />
+                {/* Month labels */}
+                {['Jan','Mar','May','Jul','Sep','Nov'].map((m, i) => (
+                  <text key={m} x={i * 96} y={108} fontSize={9} fill="var(--t4)" textAnchor="middle">{m}</text>
+                ))}
+              </svg>
+
+              {/* Insight */}
+              <div className="mt-3 flex items-start gap-2 border-t border-[var(--ln)] pt-3">
+                <span className="w-1 h-1 rounded-full bg-[var(--afg)] mt-1.5 shrink-0" />
+                <p className="text-[11px] text-[var(--t3)] leading-relaxed">
+                  MRR grew <span className="text-[var(--t2)] font-medium">4× in 12 months</span>, with the steepest acceleration between July and September.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Floating label */}
+          <p className="text-center text-[11px] text-[var(--t5)] mt-5 tracking-wide">
+            Built with your actual data · nothing stored server-side
+          </p>
         </div>
       </section>
 
-      {/* Sample cards */}
-      <section className="max-w-5xl mx-auto px-6 pb-20">
-        <p className="text-center text-[11px] text-[var(--t4)] uppercase tracking-widest font-medium mb-5">
-          Start with sample data
+      {/* ── Sample datasets ── */}
+      <section className="border-t border-[var(--ln)] max-w-5xl mx-auto px-6 py-16">
+        <p className="text-[11px] text-[var(--t4)] uppercase tracking-widest font-semibold mb-6 text-center">
+          Or start with a sample dataset
         </p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {SAMPLES.map(s => (
-            <button
-              key={s.id}
-              onClick={() => onSample(s)}
-              className="group bg-[var(--sf)] border border-[var(--ln)] hover:border-[#6366f1]/40 hover:bg-[#6366f1]/5 rounded-2xl p-4 text-left transition-all"
-            >
-              <span className="text-3xl block mb-3">{s.emoji}</span>
-              <p className="text-[13px] font-medium text-[var(--t2)] group-hover:text-[var(--t1)] transition-colors leading-snug">{s.name}</p>
-              <p className="text-[11px] text-[var(--t4)] mt-1 leading-snug">{s.description}</p>
+            <button key={s.id} onClick={() => onSample(s)}
+              className="group bg-[var(--sf)] border border-[var(--ln)] hover:border-[#6366f1]/30 rounded-2xl p-4 text-left transition-all hover:-translate-y-px"
+              style={{ boxShadow: 'var(--shadow-sm)' }}>
+              <div className="mb-3 opacity-80 group-hover:opacity-100 transition-opacity">
+                {samplePreviews[s.id] ?? <span className="text-2xl">{s.emoji}</span>}
+              </div>
+              <p className="text-[12px] font-semibold text-[var(--t2)] group-hover:text-[var(--t1)] transition-colors leading-snug">{s.name}</p>
+              <p className="text-[11px] text-[var(--t5)] mt-0.5 leading-snug group-hover:text-[var(--t4)] transition-colors">{s.description}</p>
             </button>
           ))}
         </div>
       </section>
 
-      {/* Features */}
+      {/* ── How it works ── */}
       <section className="border-t border-[var(--ln)] max-w-5xl mx-auto px-6 py-20">
+        <p className="text-[11px] text-[var(--t4)] uppercase tracking-widest font-semibold mb-12 text-center">
+          How it works
+        </p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-10">
           {[
             {
+              n: '01',
+              title: 'Drop your data',
+              body: 'Upload a CSV, paste JSON, or connect a Google Sheet — no formatting or cleanup required.',
               icon: (
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
-                  <circle cx="10" cy="10" r="8.5" stroke="#6366f1" strokeWidth="1.5"/>
-                  <path d="M7 10l2 2 4-4" stroke="#6366f1" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                  <rect x="3" y="2" width="14" height="16" rx="2.5" stroke="#6366f1" strokeWidth="1.4"/>
+                  <path d="M7 7h6M7 10h6M7 13h4" stroke="#6366f1" strokeWidth="1.4" strokeLinecap="round"/>
                 </svg>
               ),
-              title: 'Natural language queries',
-              body: 'Type questions like "show sales by region as a bar chart" — the AI handles the rest.',
             },
             {
+              n: '02',
+              title: 'Ask in plain English',
+              body: '"Show top 10 by revenue as a bar chart" — the AI picks the right chart type, axes, and grouping.',
               icon: (
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
-                  <rect x="2" y="12" width="3" height="6" rx="1" fill="#6366f1"/>
-                  <rect x="7" y="8" width="3" height="10" rx="1" fill="#6366f1" opacity="0.7"/>
-                  <rect x="12" y="4" width="3" height="14" rx="1" fill="#6366f1" opacity="0.45"/>
-                  <rect x="17" y="9" width="1.5" height="9" rx="0.75" fill="#6366f1" opacity="0.3"/>
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                  <path d="M3 5.5h14M3 10h10M3 14.5h7" stroke="#6366f1" strokeWidth="1.4" strokeLinecap="round"/>
+                  <circle cx="16" cy="14.5" r="2.5" stroke="#6366f1" strokeWidth="1.4"/>
+                  <path d="M17.8 16.3l1.5 1.5" stroke="#6366f1" strokeWidth="1.4" strokeLinecap="round"/>
                 </svg>
               ),
-              title: '9 chart types',
-              body: 'Bar, line, area, scatter, bubble, pie, donut, heatmap, and composed charts.',
             },
             {
+              n: '03',
+              title: 'Explore & share',
+              body: 'Pin charts to a dashboard, export as PNG or Excel, or share a live link. Your data never leaves the browser.',
               icon: (
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
-                  <rect x="3" y="3" width="14" height="14" rx="3" stroke="#6366f1" strokeWidth="1.5"/>
-                  <path d="M7 10h6M10 7v6" stroke="#6366f1" strokeWidth="1.5" strokeLinecap="round"/>
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                  <rect x="2" y="10" width="4" height="8" rx="1" fill="#6366f1" fillOpacity="0.9"/>
+                  <rect x="8" y="6" width="4" height="12" rx="1" fill="#6366f1" fillOpacity="0.65"/>
+                  <rect x="14" y="2" width="4" height="16" rx="1" fill="#6366f1" fillOpacity="0.4"/>
                 </svg>
               ),
-              title: 'Your data stays private',
-              body: 'Data never leaves your browser. Only your query text is sent to the AI.',
             },
-          ].map(f => (
-            <div key={f.title} className="space-y-3">
-              <div className="w-9 h-9 bg-[#6366f1]/10 rounded-xl flex items-center justify-center">
-                {f.icon}
+          ].map(step => (
+            <div key={step.n} className="space-y-4">
+              <div className="flex items-center gap-3">
+                <span className="text-[11px] font-bold text-[var(--afg)] opacity-60 tabular">{step.n}</span>
+                <div className="w-px h-3 bg-[var(--ln3)]" />
+                <div className="w-8 h-8 bg-[#6366f1]/8 border border-[#6366f1]/15 rounded-xl flex items-center justify-center">
+                  {step.icon}
+                </div>
               </div>
-              <h3 className="text-[14px] font-semibold text-[var(--t1)]">{f.title}</h3>
-              <p className="text-[13px] text-[var(--t3)] leading-relaxed">{f.body}</p>
+              <h3 className="text-[14px] font-semibold text-[var(--t1)] leading-snug">{step.title}</h3>
+              <p className="text-[13px] text-[var(--t3)] leading-relaxed">{step.body}</p>
             </div>
           ))}
         </div>
       </section>
 
-      {/* Footer */}
-      <footer className="border-t border-[var(--ln)] max-w-5xl mx-auto px-6 py-8 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Logo size={15} />
-          <span className="text-[13px] text-[var(--t4)]">DataDropAI</span>
+      {/* ── Footer ── */}
+      <footer className="border-t border-[var(--ln)]">
+        <div className="max-w-5xl mx-auto px-6 py-8 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Logo size={15} />
+            <span className="text-[13px] font-medium text-[var(--t4)]">DataDropAI</span>
+          </div>
+          <p className="text-[11px] text-[var(--t5)]">Groq · Recharts · Vite · Free & open source</p>
         </div>
-        <p className="text-[12px] text-[var(--t5)]">Groq · Recharts · Vite · Free & open source</p>
       </footer>
+
     </div>
   )
 }
@@ -1222,7 +2224,10 @@ function HistoryStrip({ chartHistory, onRestore }) {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
-function Dashboard({ pins, onUnpin, onClose, colors, theme, onShare, dashCopied }) {
+function Dashboard({ pins, onUnpin, onReorder, onUpdateNote, onClose, colors, theme, onShare, dashCopied }) {
+  const [dragIdx, setDragIdx] = useState(null)
+  const [overIdx, setOverIdx] = useState(null)
+
   async function exportReport() {
     const el = document.getElementById('dashboard-grid')
     if (!el) return
@@ -1234,6 +2239,13 @@ function Dashboard({ pins, onUnpin, onClose, colors, theme, onShare, dashCopied 
       link.href = canvas.toDataURL('image/png')
       link.click()
     } catch {}
+  }
+
+  function handleDrop(toIdx) {
+    if (dragIdx === null || dragIdx === toIdx) return
+    onReorder(dragIdx, toIdx)
+    setDragIdx(null)
+    setOverIdx(null)
   }
 
   if (!pins.length) {
@@ -1259,7 +2271,7 @@ function Dashboard({ pins, onUnpin, onClose, colors, theme, onShare, dashCopied 
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
           <h2 className="text-[17px] font-semibold text-[var(--t1)]">Dashboard</h2>
-          <p className="text-[var(--t4)] text-[13px] mt-0.5">{pins.length} pinned chart{pins.length !== 1 ? 's' : ''}</p>
+          <p className="text-[var(--t4)] text-[13px] mt-0.5">{pins.length} pinned chart{pins.length !== 1 ? 's' : ''} · drag to reorder</p>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={exportReport}
@@ -1279,11 +2291,27 @@ function Dashboard({ pins, onUnpin, onClose, colors, theme, onShare, dashCopied 
 
       <div id="dashboard-grid" className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {pins.map((pin, i) => (
-          <div key={i} className="bg-[var(--sf)] border border-[var(--ln)] rounded-2xl p-5 space-y-4">
+          <div key={i}
+            draggable
+            onDragStart={() => setDragIdx(i)}
+            onDragOver={e => { e.preventDefault(); setOverIdx(i) }}
+            onDragLeave={() => setOverIdx(null)}
+            onDrop={() => handleDrop(i)}
+            onDragEnd={() => { setDragIdx(null); setOverIdx(null) }}
+            className={`bg-[var(--sf)] border rounded-2xl p-5 space-y-4 transition-all cursor-grab active:cursor-grabbing select-none ${
+              overIdx === i && dragIdx !== i
+                ? 'border-[#6366f1]/50 bg-[#6366f1]/3 scale-[1.01]'
+                : dragIdx === i
+                ? 'border-[var(--ln3)] opacity-50'
+                : 'border-[var(--ln)]'
+            }`}>
             <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-[13px] font-medium text-[var(--t1)] leading-snug truncate">{pin.config.title}</p>
-                <p className="text-[11px] text-[var(--t4)] mt-0.5 truncate">{pin.query}</p>
+              <div className="min-w-0 flex items-center gap-2">
+                <span className="text-[var(--t5)] text-[12px] shrink-0 cursor-grab">⠿</span>
+                <div className="min-w-0">
+                  <p className="text-[13px] font-medium text-[var(--t1)] leading-snug truncate">{pin.config.title}</p>
+                  <p className="text-[11px] text-[var(--t4)] mt-0.5 truncate">{pin.query}</p>
+                </div>
               </div>
               <button onClick={() => onUnpin(i)}
                 className="shrink-0 text-[11px] text-[var(--t4)] hover:text-red-400 border border-[var(--ln)] hover:border-red-400/30 px-2.5 py-1 rounded-lg transition-colors whitespace-nowrap">
@@ -1298,6 +2326,14 @@ function Dashboard({ pins, onUnpin, onClose, colors, theme, onShare, dashCopied 
                 {pin.config.insight}
               </p>
             )}
+            <textarea
+              value={pin.note || ''}
+              onChange={e => onUpdateNote(i, e.target.value)}
+              placeholder="Add a note…"
+              rows={1}
+              className="w-full bg-[var(--bg)] border border-[var(--ln)] rounded-lg px-3 py-2 text-[11px] text-[var(--t3)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/40 resize-none transition-colors"
+              style={{ minHeight: 32 }}
+            />
           </div>
         ))}
       </div>
@@ -1307,7 +2343,7 @@ function Dashboard({ pins, onUnpin, onClose, colors, theme, onShare, dashCopied 
 
 // ─── Data Input ───────────────────────────────────────────────────────────────
 
-function DataInput({ onCSV, onJSON, onURL, onSample, onFile, onFiles }) {
+function DataInput({ onCSV, onJSON, onURL, onSample, onFile, onFiles, onLiveReload, onLiveReloadSecs }) {
   const [tab, setTab] = useState('upload')
   const [paste, setPaste] = useState('')
   const [url, setUrl] = useState('')
@@ -1338,9 +2374,30 @@ function DataInput({ onCSV, onJSON, onURL, onSample, onFile, onFiles }) {
     onFiles(files)
   }
 
+  const pasteFormat = paste.trim().startsWith('{') || paste.trim().startsWith('[') ? 'JSON' : paste.trim() ? 'CSV' : null
+
+  const sampleMiniCharts = {
+    coffee:   <MiniBar  values={[8200,6100,4800,4200,3900,3600,3100,2800,2600,2200]} color="#6366f1" />,
+    stocks:   <MiniLine values={[185,182,171,165,191,210,218,226,233,229,237,243]}   color="#10b981" />,
+    olympics: <MiniBar  values={[40,40,20,18,16,15,14,13,12,12]}                     color="#f59e0b" />,
+    saas:     <MiniLine values={[12000,14500,16200,18800,21500,24200,27000,30500,34200,38000,42500,47800]} color="#6366f1" />,
+  }
+
+  const TABS = [
+    { k: 'upload', label: 'File',
+      icon: <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M8 10V3m0 0L5 6m3-3l3 3" strokeLinecap="round" strokeLinejoin="round"/><path d="M2 13h12" strokeLinecap="round"/></svg> },
+    { k: 'multi', label: 'Multi',
+      icon: <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M1 7l7-3.5L15 7l-7 3.5L1 7z" strokeLinejoin="round"/><path d="M1 11l7 3.5 7-3.5" strokeLinecap="round" strokeLinejoin="round"/></svg> },
+    { k: 'paste', label: 'Paste',
+      icon: <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="5" width="12" height="9" rx="1.5"/><path d="M5 5V4a1 1 0 011-1h4a1 1 0 011 1v1" strokeLinejoin="round"/></svg> },
+    { k: 'url', label: 'URL',
+      icon: <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M6.5 9.5l3-3" strokeLinecap="round"/><path d="M4.5 8.5L3 10a3 3 0 004.243 4.243L8.5 13" strokeLinecap="round" strokeLinejoin="round"/><path d="M11.5 7.5L13 6a3 3 0 00-4.243-4.243L7.5 3" strokeLinecap="round" strokeLinejoin="round"/></svg> },
+  ]
+
   return (
-    <div className="space-y-8 max-w-2xl mx-auto">
-      {/* Sample datasets */}
+    <div className="max-w-2xl mx-auto space-y-6">
+
+      {/* ── Sample cards ── */}
       <div className="space-y-3">
         <p className="text-[11px] text-[var(--t4)] uppercase tracking-widest font-medium text-center">
           Try a sample dataset
@@ -1350,56 +2407,78 @@ function DataInput({ onCSV, onJSON, onURL, onSample, onFile, onFiles }) {
             <button
               key={s.id}
               onClick={() => onSample(s)}
-              className="group bg-[var(--sf)] border border-[var(--ln)] hover:border-[#6366f1]/40 hover:bg-[#6366f1]/5 rounded-xl p-3 text-left transition-all"
+              className="group bg-[var(--sf)] border border-[var(--ln)] hover:border-[#6366f1]/40 hover:bg-[#6366f1]/5 rounded-xl p-3 text-left transition-all hover:-translate-y-px"
             >
-              <div className="text-xl mb-1.5">{s.emoji}</div>
-              <p className="text-[12px] font-medium text-[var(--t2)] group-hover:text-[var(--t1)] transition-colors">{s.name}</p>
-              <p className="text-[10px] text-[var(--t4)] mt-0.5 leading-snug">{s.description}</p>
+              <div className="flex items-start justify-between mb-2.5">
+                <p className="text-[11px] font-semibold text-[var(--t2)] group-hover:text-[var(--t1)] transition-colors leading-tight">{s.name}</p>
+                <div className="opacity-50 group-hover:opacity-80 transition-opacity shrink-0 ml-1">
+                  {sampleMiniCharts[s.id] ?? <span className="text-lg">{s.emoji}</span>}
+                </div>
+              </div>
+              <p className="text-[10px] text-[var(--t4)] leading-snug">{s.description}</p>
             </button>
           ))}
         </div>
       </div>
 
+      {/* ── Divider ── */}
       <div className="flex items-center gap-4">
         <div className="flex-1 h-px bg-[var(--ln)]" />
-        <span className="text-[11px] text-[var(--t5)]">or upload your own</span>
+        <span className="text-[11px] text-[var(--t5)]">or bring your own</span>
         <div className="flex-1 h-px bg-[var(--ln)]" />
       </div>
 
-      <div className="space-y-3">
-        <div className="flex gap-0.5 bg-[var(--sf)] border border-[var(--ln)] rounded-xl p-1 w-fit mx-auto">
-          {[['upload', 'Single file'], ['multi', 'Folder / Multi'], ['paste', 'Paste data'], ['url', 'URL / Sheets']].map(([k, label]) => (
+      {/* ── Tabs + content ── */}
+      <div className="space-y-4">
+
+        {/* Tab bar */}
+        <div className="flex gap-0.5 bg-[var(--sf2)] border border-[var(--ln2)] rounded-xl p-1 w-fit mx-auto">
+          {TABS.map(({ k, label, icon }) => (
             <button key={k} onClick={() => setTab(k)}
-              className={`px-3.5 py-1.5 text-[12px] rounded-lg transition-all ${
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-[12px] transition-all ${
                 tab === k
-                  ? 'bg-[var(--sf2)] text-[var(--t1)]'
+                  ? 'bg-[var(--sf3)] text-[var(--t1)]'
                   : 'text-[var(--t4)] hover:text-[var(--t2)]'
               }`}>
+              {icon}
               {label}
             </button>
           ))}
         </div>
 
+        {/* ── Upload ── */}
         {tab === 'upload' && (
           <div
             onDrop={e => { e.preventDefault(); setDragging(false); e.dataTransfer.files[0] && readFile(e.dataTransfer.files[0]) }}
             onDragOver={e => { e.preventDefault(); setDragging(true) }}
             onDragLeave={() => setDragging(false)}
             onClick={() => document.getElementById('_fi').click()}
-            className={`border-2 border-dashed rounded-2xl p-14 text-center cursor-pointer select-none transition-all ${
+            className={`border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer select-none transition-all ${
               dragging
                 ? 'border-[#6366f1] bg-[#6366f1]/5'
-                : 'border-[var(--ln2)] hover:border-[var(--ln3)]'
+                : 'border-[var(--ln2)] hover:border-[var(--ln3)] hover:bg-[var(--sf)]'
             }`}
           >
-            <div className="text-[var(--t4)] mb-3 text-xl">↑</div>
-            <p className="text-[var(--t2)] text-sm mb-1 font-medium">Drop CSV, TSV, or JSON here</p>
-            <p className="text-[var(--t4)] text-xs">or click to browse</p>
+            <svg className={`w-8 h-8 mx-auto mb-3 transition-colors ${dragging ? 'text-[#6366f1]' : 'text-[var(--t4)]'}`}
+              viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path d="M12 15V4m0 0l-4 4m4-4l4 4" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M4 20h16" strokeLinecap="round"/>
+            </svg>
+            <p className={`text-sm font-medium mb-1 transition-colors ${dragging ? 'text-[var(--t1)]' : 'text-[var(--t2)]'}`}>
+              {dragging ? 'Drop to load' : 'Drop a file here'}
+            </p>
+            <p className="text-[var(--t4)] text-xs mb-4">or click to browse</p>
+            <div className="flex items-center justify-center gap-1.5">
+              {['.csv', '.tsv', '.json'].map(ext => (
+                <span key={ext} className="text-[10px] font-mono bg-[var(--sf2)] border border-[var(--ln)] text-[var(--t4)] px-2 py-0.5 rounded-md">{ext}</span>
+              ))}
+            </div>
             <input id="_fi" type="file" accept=".csv,.tsv,.json,.txt" className="hidden"
               onChange={e => e.target.files[0] && readFile(e.target.files[0])} />
           </div>
         )}
 
+        {/* ── Multi ── */}
         {tab === 'multi' && (
           <div className="space-y-3">
             <div
@@ -1412,18 +2491,27 @@ function DataInput({ onCSV, onJSON, onURL, onSample, onFile, onFiles }) {
                   : 'border-[var(--ln2)]'
               }`}
             >
-              <div className="text-[var(--t4)] mb-3 text-2xl">⊞</div>
-              <p className="text-[var(--t2)] text-sm mb-1 font-medium">Drop multiple CSV files here</p>
-              <p className="text-[var(--t4)] text-xs mb-5">All files will be merged — a <code className="font-mono bg-[var(--sf2)] px-1 rounded">source_file</code> column is added automatically</p>
+              <svg className={`w-8 h-8 mx-auto mb-3 transition-colors ${multiDragging ? 'text-[#6366f1]' : 'text-[var(--t4)]'}`}
+                viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <path d="M4 6l8-4 8 4-8 4-8-4z" strokeLinejoin="round"/>
+                <path d="M4 12l8 4 8-4" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M4 18l8 4 8-4" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              <p className="text-[var(--t2)] text-sm font-medium mb-1">Drop multiple CSV files</p>
+              <p className="text-[var(--t4)] text-xs mb-5">
+                All files will be merged — a{' '}
+                <code className="font-mono bg-[var(--sf2)] border border-[var(--ln)] text-[var(--t3)] px-1.5 py-0.5 rounded text-[10px]">source_file</code>
+                {' '}column is added automatically
+              </p>
               <div className="flex items-center justify-center gap-3">
                 <button
-                  onClick={() => document.getElementById('_fi_multi').click()}
+                  onClick={e => { e.stopPropagation(); document.getElementById('_fi_multi').click() }}
                   className="text-[13px] font-medium bg-[#6366f1] hover:bg-[#5254cc] text-white px-4 py-2 rounded-lg transition-colors">
                   Select files
                 </button>
                 <button
-                  onClick={() => document.getElementById('_fi_folder').click()}
-                  className="text-[13px] font-medium border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t2)] px-4 py-2 rounded-lg transition-colors">
+                  onClick={e => { e.stopPropagation(); document.getElementById('_fi_folder').click() }}
+                  className="text-[13px] font-medium bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t2)] px-4 py-2 rounded-lg transition-colors">
                   Select folder
                 </button>
               </div>
@@ -1439,35 +2527,154 @@ function DataInput({ onCSV, onJSON, onURL, onSample, onFile, onFiles }) {
           </div>
         )}
 
+        {/* ── Paste ── */}
         {tab === 'paste' && (
           <div className="space-y-2.5">
-            <textarea value={paste} onChange={e => setPaste(e.target.value)}
-              placeholder={'name,sales,region\nApple,4200,West\nBanana,3100,East'}
-              className="w-full h-44 bg-[var(--sf)] border border-[var(--ln)] rounded-xl px-4 py-3 text-sm text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/50 font-mono resize-none transition-colors" />
+            <div className="relative">
+              <textarea value={paste} onChange={e => setPaste(e.target.value)}
+                placeholder={'name,sales,region\nApple,4200,West\nBanana,3100,East'}
+                className="w-full h-44 bg-[var(--sf)] border border-[var(--ln)] rounded-xl px-4 py-3 pr-28 text-sm text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/50 font-mono resize-none transition-colors" />
+              <div className="absolute top-2.5 right-2.5 flex items-center gap-1.5 pointer-events-none">
+                {pasteFormat && (
+                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${
+                    pasteFormat === 'JSON'
+                      ? 'bg-[#f59e0b]/10 text-[#f59e0b] border-[#f59e0b]/20'
+                      : 'bg-[#6366f1]/10 text-[var(--afg)] border-[#6366f1]/20'
+                  }`}>{pasteFormat}</span>
+                )}
+                {paste && (
+                  <span className="text-[10px] text-[var(--t5)] tabular">{paste.length.toLocaleString()}</span>
+                )}
+              </div>
+            </div>
             <button onClick={handlePaste} disabled={!paste.trim()}
-              className="bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm px-5 py-2 rounded-lg transition-colors">
+              className="bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors">
               Load data
             </button>
           </div>
         )}
 
+        {/* ── URL ── */}
         {tab === 'url' && (
           <div className="space-y-2.5">
             <input type="url" value={url} onChange={e => setUrl(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && url.trim() && onURL(url.trim())}
               placeholder="https://docs.google.com/spreadsheets/d/… or any CSV / JSON URL"
               className="w-full bg-[var(--sf)] border border-[var(--ln)] rounded-xl px-4 py-3 text-sm text-[var(--t1)] placeholder:text-[var(--t4)] focus:outline-none focus:border-[#6366f1]/50 transition-colors" />
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
               <button onClick={() => url.trim() && onURL(url.trim())} disabled={!url.trim()}
-                className="bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm px-5 py-2 rounded-lg transition-colors">
+                className="bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors">
                 Fetch & load
               </button>
-              <span className="text-[11px] text-[var(--t4)]">Google Sheets must be shared publicly</span>
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-[var(--t4)]">Auto-refresh</span>
+                <select value={onLiveReloadSecs || 0}
+                  onChange={e => onLiveReload && onLiveReload(url.trim(), Number(e.target.value))}
+                  className="bg-[var(--sf2)] border border-[var(--ln)] rounded-lg px-2 py-1 text-[11px] text-[var(--t3)] focus:outline-none cursor-pointer">
+                  <option value={0}>Off</option>
+                  <option value={30}>30s</option>
+                  <option value={60}>1m</option>
+                  <option value={300}>5m</option>
+                  <option value={600}>10m</option>
+                </select>
+              </div>
+            </div>
+            <div className="flex items-start gap-1.5 pt-0.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#34a853] shrink-0 mt-[3px]" />
+              <span className="text-[11px] text-[var(--t5)] leading-relaxed">Google Sheets URLs are auto-converted — make sure the sheet is shared publicly</span>
             </div>
           </div>
         )}
+
       </div>
     </div>
+  )
+}
+
+// ─── SmartOverview ────────────────────────────────────────────────────────────
+
+function SmartOverview({ overview, loading, anomalies, onQuestion, onShowAnomalies }) {
+  return (
+    <div className="space-y-5 chart-fade-in">
+
+      {/* ── Headline ── */}
+      {loading && !overview ? (
+        <div className="space-y-2 pt-1">
+          <div className="h-7 bg-[var(--sf2)] rounded-xl animate-pulse" style={{ width: '68%' }} />
+          <div className="h-5 bg-[var(--sf2)] rounded-xl animate-pulse" style={{ width: '45%' }} />
+        </div>
+      ) : overview?.headline ? (
+        <h2 className="text-[21px] font-semibold text-[var(--t1)] leading-snug tracking-tight pt-1">
+          <FormatInsight text={overview.headline} />
+        </h2>
+      ) : null}
+
+      {/* ── Key insights ── */}
+      {loading && !overview ? (
+        <div className="space-y-2.5">
+          {[72, 58, 64].map((w, i) => (
+            <div key={i} className="flex items-center gap-2.5">
+              <div className="w-1.5 h-1.5 rounded-full bg-[var(--sf3)] shrink-0" />
+              <div className="h-3.5 bg-[var(--sf2)] rounded-lg animate-pulse" style={{ width: `${w}%` }} />
+            </div>
+          ))}
+        </div>
+      ) : overview?.insights?.length > 0 ? (
+        <div className="space-y-2.5">
+          {overview.insights.map((ins, i) => (
+            <div key={i} className="flex items-start gap-2.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#6366f1] shrink-0 mt-[5px]" />
+              <p className="text-[13px] text-[var(--t2)] leading-relaxed">
+                <FormatInsight text={ins} />
+              </p>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {/* ── Anomaly notice (subtle) ── */}
+      {anomalies.length > 0 && (
+        <button onClick={onShowAnomalies}
+          className="flex items-center gap-1.5 text-[11px] text-[var(--t5)] hover:text-amber-400 transition-colors group">
+          <span className="text-amber-400/60 group-hover:text-amber-400 transition-colors text-[12px]">⚠</span>
+          {anomalies.length} potential data issue{anomalies.length !== 1 ? 's' : ''} detected
+          <span className="text-[var(--t5)] group-hover:text-[var(--t3)] transition-colors">· view details →</span>
+        </button>
+      )}
+
+      {/* ── Suggested questions ── */}
+      {overview?.questions?.length > 0 && (
+        <div className="space-y-2.5">
+          <p className="text-[10px] font-semibold text-[var(--t5)] uppercase tracking-widest">Start exploring</p>
+          <div className="flex flex-wrap gap-1.5">
+            {overview.questions.map(q => (
+              <button key={q} onClick={() => onQuestion(q)}
+                className="text-[12px] bg-[#6366f1]/5 border border-[#6366f1]/15 hover:border-[#6366f1]/30 text-[var(--afg)] hover:bg-[#6366f1]/10 px-4 py-2 rounded-full transition-colors">
+                {q}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+    </div>
+  )
+}
+
+// ─── FormatInsight ────────────────────────────────────────────────────────────
+
+function FormatInsight({ text }) {
+  if (!text) return null
+  // Bold numbers (integers, decimals, percentages, currency prefixed)
+  const parts = text.split(/(\$?[\d,]+\.?\d*%?(?:\s*[xX])?)/g)
+  return (
+    <>
+      {parts.map((part, i) =>
+        /^\$?[\d,]+\.?\d*%?(?:\s*[xX])?$/.test(part) && part !== ''
+          ? <strong key={i} className="font-semibold text-[var(--t1)]">{part}</strong>
+          : <span key={i}>{part}</span>
+      )}
+    </>
   )
 }
 
@@ -1516,12 +2723,113 @@ export default function App() {
   const [toasts, setToasts]             = useState([])
   const [loadingMsg, setLoadingMsg]     = useState('')
   const [showAvgLine, setShowAvgLine]   = useState(false)
+  const [showDataLabels, setShowDataLabels] = useState(false)
+  const [showTrendLine, setShowTrendLine]   = useState(false)
+  const [forecastPeriods, setForecastPeriods] = useState(0)
+  const [showDualYAxis, setShowDualYAxis]   = useState(false)
+  const [stackedBar, setStackedBar]         = useState(false)
+  const [rowFilterExpr, setRowFilterExpr]   = useState('')
+  const [showRowFilter, setShowRowFilter]   = useState(false)
+  const [streamingText, setStreamingText]   = useState('')
+  const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('datadropai_onboarded'))
+  const [lastUpdatedAt, setLastUpdatedAt]   = useState(null)
+  const [trends, setTrends]                 = useState(null)
+  const [eli5Mode, setEli5Mode]             = useState(false)
+  const [alerts, setAlerts]                 = useState(() => {
+    try { return JSON.parse(localStorage.getItem('datadropai_alerts') || '[]') } catch { return [] }
+  })
+  const [showAlerts, setShowAlerts]         = useState(false)
+  const [alertTriggered, setAlertTriggered] = useState([]) // ids triggered this session
+  const [focusMode, setFocusMode]           = useState(false)
+  const [queryFocused, setQueryFocused]     = useState(false)
+  const [chartTypeOpen, setChartTypeOpen]   = useState(false)
+  const [showDatasetDetails, setShowDatasetDetails] = useState(false)
+  const [smartOverview, setSmartOverview]     = useState(null)
+  const [overviewLoading, setOverviewLoading] = useState(false)
+  const [hasQueried, setHasQueried]           = useState(false)
+  const [chartHidden, setChartHidden]         = useState(false)
+
+  const [undoStack, setUndoStack]       = useState([])
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft]     = useState('')
+  const [explanation, setExplanation]   = useState(null)
+  const [explanationLoading, setExplanationLoading] = useState(false)
+  const [anomalies, setAnomalies]       = useState([])
+  const [anomaliesLoading, setAnomaliesLoading] = useState(false)
+  const [reportLoading, setReportLoading] = useState(false)
+
+  const [profile, setProfile]           = useState(null)
+  const [profileLoading, setProfileLoading] = useState(false)
+
+  const [columnFilters, setColumnFilters] = useState({})
+  const [showFilterPanel, setShowFilterPanel] = useState(false)
+  const [calcColExpr, setCalcColExpr]   = useState('')
+  const [showCalcCol, setShowCalcCol]   = useState(false)
+
+  const [savedWorkspaces, setSavedWorkspaces] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('datadropai_workspaces') || '[]') } catch { return [] }
+  })
+  const [showWorkspaces, setShowWorkspaces] = useState(false)
+
+  const [liveReloadSecs, setLiveReloadSecs] = useState(0)
+  const [liveReloadUrl, setLiveReloadUrl]   = useState('')
 
   const chartRef     = useRef(null)
   const queryInputRef = useRef(null)
   const exportMenuRef = useRef(null)
 
   const activeColors = PALETTES[palette] ?? PALETTES.datadropai
+
+  function closeOnboarding() {
+    setShowOnboarding(false)
+    localStorage.setItem('datadropai_onboarded', '1')
+  }
+
+  // ── Alerts ──
+
+  function saveAlerts(next) {
+    setAlerts(next)
+    localStorage.setItem('datadropai_alerts', JSON.stringify(next))
+  }
+
+  function addAlert(alert) {
+    const next = [...alerts, { ...alert, id: Date.now().toString() }]
+    saveAlerts(next)
+    // Request browser notification permission on first alert
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission()
+    }
+  }
+
+  function removeAlert(id) { saveAlerts(alerts.filter(a => a.id !== id)) }
+  function toggleAlert(id) { saveAlerts(alerts.map(a => a.id === id ? { ...a, enabled: !a.enabled } : a)) }
+
+  function checkAndFireAlerts(currentRows) {
+    if (!currentRows.length || !alerts.length) return
+    const evalOp = (op, a, b) => ({ '>': a>b, '<': a<b, '>=': a>=b, '<=': a<=b, '=': a===b }[op] ?? false)
+    const newlyTriggered = []
+    alerts.forEach(alert => {
+      if (!alert.enabled) return
+      const vals = currentRows.map(r => Number(r[alert.column])).filter(v => !isNaN(v))
+      if (!vals.length) return
+      const candidate = {
+        any:  vals.some(v => evalOp(alert.op, v, alert.value)),
+        avg:  evalOp(alert.op, vals.reduce((a,b)=>a+b,0)/vals.length, alert.value),
+        max:  evalOp(alert.op, Math.max(...vals), alert.value),
+        min:  evalOp(alert.op, Math.min(...vals), alert.value),
+      }[alert.aggregate] ?? false
+      if (candidate && !alertTriggered.includes(alert.id)) {
+        newlyTriggered.push(alert.id)
+        addToast(`Alert: ${alert.label}`, 'error')
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('DataDropAI Alert', { body: alert.label, silent: false })
+        }
+      }
+    })
+    if (newlyTriggered.length) {
+      setAlertTriggered(prev => [...prev, ...newlyTriggered])
+    }
+  }
 
   function addToast(message, type = 'success') {
     const id = Date.now() + Math.random()
@@ -1564,17 +2872,59 @@ export default function App() {
         queryInputRef.current?.focus()
         queryInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
       }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !isInput) {
+        e.preventDefault()
+        setUndoStack(prev => {
+          if (!prev.length) return prev
+          const [last, ...rest] = prev
+          setChartConfig(last.config)
+          setChartData(last.data)
+          setChartId(id => id + 1)
+          return rest
+        })
+      }
       if (e.key === 'Escape') {
-        if (fullscreen) setFullscreen(false)
+        if (showOnboarding) closeOnboarding()
+        else if (fullscreen) setFullscreen(false)
+        else if (showFilterPanel) setShowFilterPanel(false)
+        else if (showWorkspaces) setShowWorkspaces(false)
         else if (isInput) document.activeElement.blur()
       }
       if (e.key === 'f' && !isInput && !fullscreen && chartConfig) {
         setFullscreen(true)
       }
+      if (e.key === '?' && !isInput) {
+        setShowOnboarding(true)
+      }
     }
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
-  }, [fullscreen])
+  }, [fullscreen, showFilterPanel, showWorkspaces, showOnboarding, chartConfig])
+
+  // ── Global paste (Cmd+V) CSV/JSON ──
+  useEffect(() => {
+    function handlePaste(e) {
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      const text = e.clipboardData?.getData('text')
+      if (!text?.trim()) return
+      const t = text.trim()
+      if (t.startsWith('{') || t.startsWith('[')) loadJSON(t)
+      else if (t.includes(',') || t.includes('\t')) loadCSV(t)
+    }
+    document.addEventListener('paste', handlePaste)
+    return () => document.removeEventListener('paste', handlePaste)
+  }, [])
+
+  // ── Live-reload interval ──
+  useEffect(() => {
+    if (!liveReloadSecs || !liveReloadUrl) return
+    const id = setInterval(() => {
+      loadURL(liveReloadUrl)
+      // rows may not be updated yet; alert check fires via the data-load effect
+    }, liveReloadSecs * 1000)
+    return () => clearInterval(id)
+  }, [liveReloadSecs, liveReloadUrl])
 
   // ── Export menu click-outside ──
   useEffect(() => {
@@ -1584,20 +2934,45 @@ export default function App() {
     return () => document.removeEventListener('mousedown', close)
   }, [exportOpen])
 
+  // ── Chart type dropdown click-outside ──
+  useEffect(() => {
+    if (!chartTypeOpen) return
+    function close() { setChartTypeOpen(false) }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [chartTypeOpen])
+
   // ── Auto-focus query input when data loads ──
   useEffect(() => {
     if (dataLoaded) setTimeout(() => queryInputRef.current?.focus(), 200)
   }, [dataLoaded])
 
-  // ── AI suggestions ──
+  // ── AI suggestions + profile + anomalies ──
   useEffect(() => {
     if (!dataLoaded || !columns.length || !rows.length) return
+    const key = apiKey.trim()
+
     setSuggestionsLoading(true)
     setSuggestions([])
-    generateSuggestions(columns, rows, apiKey.trim())
+    generateSuggestions(columns, rows, key)
       .then(s => setSuggestions(s))
       .catch(() => setSuggestions([]))
       .finally(() => setSuggestionsLoading(false))
+
+    setProfileLoading(true)
+    setProfile(null)
+    generateDatasetProfile(columns, rows, key)
+      .then(p => setProfile(p))
+      .catch(() => setProfile(null))
+      .finally(() => setProfileLoading(false))
+
+    setAnomaliesLoading(true)
+    setAnomalies([])
+    detectAnomalies(columns, rows, key)
+      .then(a => setAnomalies(a))
+      .catch(() => setAnomalies([]))
+      .finally(() => setAnomaliesLoading(false))
+    checkAndFireAlerts(rows)
   }, [dataLoaded]) // intentionally runs once per data load
 
   // ── Mount: URL restore → dashboard restore → session restore ──
@@ -1697,13 +3072,41 @@ export default function App() {
     setPreviewOpen(false)
     setDataLabel(label)
     setError('')
-    setChartConfig(null)
-    setChartData([])
     setQuery('')
     setChartView('chart')
     setSuggestions([])
+    setProfile(null)
+    setAnomalies([])
+    setColumnFilters({})
+    setUndoStack([])
+    setExplanation(null)
     setPage('app')
     setRowWarning(newRows.length > 10_000)
+    setLastUpdatedAt(Date.now())
+    setTrends(computeTrends(newRows, inferColumns(newRows)))
+    setAlertTriggered([])
+    setHasQueried(false)
+    setChartHidden(false)
+
+    // ── Set initial chart immediately (client-side, no AI) ──
+    const initCfg = pickInitialChart(cols)
+    if (initCfg) {
+      const agg = aggregateData(newRows, initCfg, cols)
+      const { data: sampled } = sampleForChart(agg, initCfg.chartType)
+      setChartConfig(initCfg)
+      setChartData(sampled)
+    } else {
+      setChartConfig(null)
+      setChartData([])
+    }
+
+    // ── Smart Overview context (AI, async) ──
+    setSmartOverview(null)
+    setOverviewLoading(true)
+    generateSmartOverview(cols, newRows, apiKey.trim())
+      .then(ov => setSmartOverview(ov))
+      .catch(() => setSmartOverview(null))
+      .finally(() => setOverviewLoading(false))
   }
 
   function loadCSV(text) {
@@ -1835,6 +3238,7 @@ export default function App() {
       const trimmed = text.trimStart()
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) loadJSON(text)
       else loadCSV(text)
+      setLastUpdatedAt(Date.now())
     } catch (e) { setError('Fetch failed: ' + e.message) }
   }
 
@@ -1856,7 +3260,12 @@ export default function App() {
     setQuery(''); setFollowUp(''); setError('')
     setDataLabel(''); setChartHistory([])
     setSuggestions([]); setChartView('chart')
-    setRowWarning(false)
+    setRowWarning(false); setProfile(null); setAnomalies([])
+    setColumnFilters({}); setUndoStack([]); setExplanation(null)
+    setLiveReloadSecs(0); setLiveReloadUrl('')
+    setRowFilterExpr(''); setShowRowFilter(false)
+    setSmartOverview(null); setOverviewLoading(false)
+    setHasQueried(false); setChartHidden(false)
     localStorage.removeItem('datadropai_session')
   }
 
@@ -1871,7 +3280,9 @@ export default function App() {
     }
 
     setLoading(true); setError(''); setChartConfig(null); setChartView('chart'); setSampledNotice(null)
+    setExplanation(null)
     setLoadingMsg('Analyzing your data…')
+    setHasQueried(true)
 
     try {
       const systemPrompt = buildSystemPrompt(columns, rows)
@@ -1881,7 +3292,13 @@ export default function App() {
       }
       messages.push({ role: 'user', content: question })
       setLoadingMsg('Asking AI…')
-      const raw = await queryLLM(messages, apiKey.trim())
+      setStreamingText('')
+      const raw = await streamQueryLLM(messages, apiKey.trim(), (partial) => {
+        setStreamingText(partial)
+        const m = partial.match(/"title"\s*:\s*"([^"\\]{3,60})/)
+        if (m) setLoadingMsg(`Building: ${m[1]}`)
+      })
+      setStreamingText('')
       setLoadingMsg('Building chart…')
 
       let parsed
@@ -1892,30 +3309,75 @@ export default function App() {
         parsed = JSON.parse(match[0])
       }
 
+      // Insight-only answer (no chart)
+      if (parsed.answerType === 'insight' && parsed.answer) {
+        setChartConfig({ ...parsed, answerType: 'insight', title: question })
+        setChartData([])
+        setChartId(prev => prev + 1)
+        setLoading(false); setLoadingMsg('')
+        return
+      }
+
       if (!parsed.chartType || !parsed.xAxis) {
         throw new Error('Couldn\'t determine a chart. Try: "bar chart of sales by region"')
       }
 
       const config = normalizeConfig(parsed, columns)
 
-      let sourceRows = rows
+      // Apply row expression filter + column filters from UI
+      let sourceRows = applyRowFilter(rows, rowFilterExpr)
+      Object.entries(columnFilters).forEach(([col, excluded]) => {
+        if (excluded.size > 0) {
+          sourceRows = sourceRows.filter(r => !excluded.has(String(r[col] ?? '')))
+        }
+      })
+
+      // Apply AI filter
       if (config.filter?.column && Array.isArray(config.filter.values) && config.filter.values.length) {
         const col = config.filter.column
         const vals = new Set(config.filter.values.map(v => String(v).toLowerCase()))
-        sourceRows = rows.filter(r => vals.has(String(r[col] ?? '').toLowerCase()))
-        if (!sourceRows.length) sourceRows = rows
+        const filtered = sourceRows.filter(r => vals.has(String(r[col] ?? '').toLowerCase()))
+        if (filtered.length) sourceRows = filtered
       }
 
-      const processed = aggregateData(sourceRows, config, columns)
+      let processed = aggregateData(sourceRows, config, columns)
       if (!processed.length) throw new Error('Aggregation returned no data. Try different grouping.')
+
+      // Apply sort + limit
+      if (config.sortBy && config.sortBy !== 'none') {
+        const sortKey = config.sortBy === 'yAxis'
+          ? (Array.isArray(config.yAxis) ? config.yAxis[0] : config.yAxis)
+          : config.xAxis
+        processed = [...processed].sort((a, b) => {
+          const av = Number(a[sortKey]), bv = Number(b[sortKey])
+          const cmp = !isNaN(av) && !isNaN(bv) ? av - bv : String(a[sortKey] ?? '').localeCompare(String(b[sortKey] ?? ''))
+          return config.sortOrder === 'asc' ? cmp : -cmp
+        })
+      }
+      if (config.limit) {
+        processed = processed.slice(0, config.limit)
+      }
 
       const { data: chartSampled, sampled, total } = sampleForChart(processed, config.chartType)
       setSampledNotice(sampled ? { total, shown: chartSampled.length } : null)
+
+      // Push undo before replacing
+      if (chartConfig && chartData.length) {
+        setUndoStack(prev => [{ config: chartConfig, data: chartData }, ...prev].slice(0, 20))
+      }
 
       setChartConfig(config)
       setChartData(chartSampled)
       setChartId(prev => prev + 1)
       setChartHistory(prev => [{ config, data: processed, columns, query: question }, ...prev].slice(0, 12))
+
+      // Auto-explain every chart (non-blocking)
+      setExplanationLoading(true)
+      setExplanation(null)
+      explainChart(config, chartSampled, apiKey.trim(), eli5Mode)
+        .then(r => setExplanation(r.explanation || null))
+        .catch(() => setExplanation(null))
+        .finally(() => setExplanationLoading(false))
     } catch (e) {
       if (e.status === 429 || e.message?.toLowerCase().includes('rate limit')) {
         setRateLimitEnd(Date.now() + 60_000)
@@ -1925,6 +3387,7 @@ export default function App() {
     } finally {
       setLoading(false)
       setLoadingMsg('')
+      setStreamingText('')
     }
   }
 
@@ -2046,6 +3509,191 @@ export default function App() {
     setChartConfig(newConfig)
     setChartId(prev => prev + 1)
     setShowAvgLine(false)
+    setStackedBar(false)
+  }
+
+  // ── New handlers ──
+
+  function exportXLSX() {
+    if (!chartData.length) return
+    const cols = Object.keys(chartData[0]).filter(k => !k.startsWith('_'))
+    const ws = XLSX.utils.aoa_to_sheet([cols, ...chartData.map(row => cols.map(c => row[c] ?? ''))])
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'Chart Data')
+    XLSX.writeFile(wb, `datadropai-${Date.now()}.xlsx`)
+    addToast('Excel exported')
+  }
+
+  function exportSVG() {
+    const svgEl = chartRef.current?.querySelector('svg')
+    if (!svgEl) { addToast('No SVG found — PNG export works for all chart types', 'error'); return }
+    const xml = new XMLSerializer().serializeToString(svgEl)
+    const blob = new Blob([xml], { type: 'image/svg+xml' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `datadropai-${Date.now()}.svg`; a.click()
+    URL.revokeObjectURL(url)
+    addToast('SVG exported')
+  }
+
+  function copyEmbedCode() {
+    if (!chartConfig) return
+    const payload = encodeShare({ config: chartConfig, data: chartData.slice(0, 150), columns })
+    if (!payload) return
+    const src = `${location.origin}${location.pathname}?c=${payload}`
+    const code = `<iframe src="${src}" width="800" height="500" frameborder="0" style="border-radius:12px;border:1px solid #e5e7eb"></iframe>`
+    navigator.clipboard.writeText(code).catch(() => {})
+    addToast('Embed code copied to clipboard')
+  }
+
+  function addCalculatedColumn(expr) {
+    if (!expr.trim() || !rows.length) return
+    try {
+      const cols = Object.keys(rows[0])
+      // Safe eval: only allow access to column values, no globals
+      const fn = new Function(...cols, `"use strict"; return (${expr})`)
+      const colName = `calc_${expr.replace(/[^a-z0-9]/gi, '_').slice(0, 20)}`
+      const newRows = rows.map(r => {
+        try {
+          const val = fn(...cols.map(c => Number(r[c]) || r[c]))
+          return { ...r, [colName]: String(val ?? '') }
+        } catch { return { ...r, [colName]: '' } }
+      })
+      loadData(newRows, dataLabel)
+      addToast(`Column "${colName}" added`)
+      setShowCalcCol(false)
+      setCalcColExpr('')
+    } catch (e) { addToast('Expression error: ' + e.message, 'error') }
+  }
+
+  function updateAxis(field, value) {
+    if (!chartConfig || !rows.length) return
+    const newConfig = normalizeConfig({ ...chartConfig, [field]: value }, columns)
+    let sourceRows = applyRowFilter(rows, rowFilterExpr)
+    Object.entries(columnFilters).forEach(([col, excluded]) => {
+      if (excluded.size > 0) sourceRows = sourceRows.filter(r => !excluded.has(String(r[col] ?? '')))
+    })
+    if (newConfig.filter?.column && newConfig.filter.values?.length) {
+      const col = newConfig.filter.column
+      const vals = new Set(newConfig.filter.values.map(v => String(v).toLowerCase()))
+      const filtered = sourceRows.filter(r => vals.has(String(r[col] ?? '').toLowerCase()))
+      if (filtered.length) sourceRows = filtered
+    }
+    let processed = aggregateData(sourceRows, newConfig, columns)
+    if (!processed.length) return
+    if (newConfig.sortBy && newConfig.sortBy !== 'none') {
+      const sortKey = newConfig.sortBy === 'yAxis'
+        ? (Array.isArray(newConfig.yAxis) ? newConfig.yAxis[0] : newConfig.yAxis)
+        : newConfig.xAxis
+      processed = [...processed].sort((a, b) => {
+        const av = Number(a[sortKey]), bv = Number(b[sortKey])
+        const cmp = !isNaN(av) && !isNaN(bv) ? av - bv : String(a[sortKey] ?? '').localeCompare(String(b[sortKey] ?? ''))
+        return newConfig.sortOrder === 'asc' ? cmp : -cmp
+      })
+    }
+    if (newConfig.limit) processed = processed.slice(0, newConfig.limit)
+    const { data: sampled } = sampleForChart(processed, newConfig.chartType)
+    setUndoStack(prev => [{ config: chartConfig, data: chartData }, ...prev].slice(0, 20))
+    setChartConfig(newConfig)
+    setChartData(sampled)
+    setChartId(id => id + 1)
+  }
+
+  function exportAllData() {
+    if (!rows.length) return
+    const cols = Object.keys(rows[0])
+    const csvRows = rows.map(row =>
+      cols.map(c => {
+        const v = String(row[c] ?? '')
+        return v.includes(',') || v.includes('"') || v.includes('\n')
+          ? `"${v.replace(/"/g, '""')}"` : v
+      }).join(',')
+    )
+    const blob = new Blob([[cols.join(','), ...csvRows].join('\n')], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `${(dataLabel || 'data').replace(/[^a-z0-9]/gi, '_')}-${Date.now()}.csv`; a.click()
+    URL.revokeObjectURL(url)
+    addToast(`Exported ${rows.length.toLocaleString()} rows`)
+  }
+
+  function reorderPins(fromIdx, toIdx) {
+    setPins(prev => {
+      const arr = [...prev]
+      const [item] = arr.splice(fromIdx, 1)
+      arr.splice(toIdx, 0, item)
+      return arr
+    })
+  }
+
+  function updatePinNote(idx, note) {
+    setPins(prev => prev.map((p, i) => i === idx ? { ...p, note } : p))
+  }
+
+  function saveWorkspace(name) {
+    const ws = {
+      name,
+      cols: columns.length,
+      columns,
+      chartConfig,
+      chartData,
+      pins: pins.slice(0, 10),
+      palette,
+      savedAt: Date.now(),
+    }
+    const updated = [ws, ...savedWorkspaces].slice(0, 20)
+    setSavedWorkspaces(updated)
+    localStorage.setItem('datadropai_workspaces', JSON.stringify(updated))
+    addToast(`Workspace "${name}" saved`)
+  }
+
+  function loadWorkspace(ws) {
+    if (ws.columns?.length) setColumns(ws.columns)
+    if (ws.chartConfig) { setChartConfig(ws.chartConfig); setChartData(ws.chartData || []) }
+    if (ws.pins?.length) setPins(ws.pins)
+    if (ws.palette) setPalette(ws.palette)
+    setChartId(prev => prev + 1)
+    setShowWorkspaces(false)
+    addToast(`Workspace "${ws.name}" loaded`)
+  }
+
+  function deleteWorkspace(idx) {
+    const updated = savedWorkspaces.filter((_, i) => i !== idx)
+    setSavedWorkspaces(updated)
+    localStorage.setItem('datadropai_workspaces', JSON.stringify(updated))
+  }
+
+  async function runExplain(forceEli5 = eli5Mode) {
+    if (!chartConfig || !chartData.length) return
+    setExplanationLoading(true)
+    setExplanation(null)
+    try {
+      const result = await explainChart(chartConfig, chartData, apiKey.trim(), forceEli5)
+      setExplanation(result.explanation || null)
+    } catch { setExplanation(null) }
+    finally { setExplanationLoading(false) }
+  }
+
+  async function runReport() {
+    if (!rows.length) { setError('Re-upload your data first.'); return }
+    setReportLoading(true)
+    addToast('Generating full report…')
+    try {
+      const result = await generateReport(columns, rows, apiKey.trim())
+      if (!Array.isArray(result.charts) || !result.charts.length) throw new Error('No charts returned')
+      const newPins = result.charts.map(cfg => {
+        const config = normalizeConfig({ ...cfg, insight: cfg.insight }, columns)
+        let processed = aggregateData(rows, config, columns)
+        if (!processed.length) processed = rows.slice(0, 20)
+        const { data } = sampleForChart(processed, config.chartType)
+        return { config, data, columns, query: 'Auto-report' }
+      }).filter(p => p.data.length)
+      setPins(prev => [...newPins, ...prev].slice(0, 20))
+      setView('dashboard')
+      addToast(`Report generated — ${newPins.length} charts pinned`)
+      if (result.narrative) addToast(result.narrative.slice(0, 80) + (result.narrative.length > 80 ? '…' : ''))
+    } catch (e) { addToast('Report generation failed: ' + e.message, 'error') }
+    finally { setReportLoading(false) }
   }
 
   // ── Landing page ──
@@ -2065,6 +3713,33 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--t1)] antialiased">
+
+      {/* Onboarding modal */}
+      {showOnboarding && <OnboardingModal onClose={closeOnboarding} />}
+
+      {/* Alert panel */}
+      {showAlerts && (
+        <AlertPanel
+          alerts={alerts}
+          columns={columns}
+          triggeredIds={alertTriggered}
+          onAdd={addAlert}
+          onRemove={removeAlert}
+          onToggle={toggleAlert}
+          onClose={() => setShowAlerts(false)}
+        />
+      )}
+
+      {/* Workspace modal */}
+      {showWorkspaces && (
+        <WorkspaceModal
+          workspaces={savedWorkspaces}
+          onSave={saveWorkspace}
+          onLoad={loadWorkspace}
+          onDelete={deleteWorkspace}
+          onClose={() => setShowWorkspaces(false)}
+        />
+      )}
 
       {/* Toast stack */}
       {toasts.length > 0 && (
@@ -2108,68 +3783,75 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header
-        className="sticky top-0 z-20 border-b border-[var(--ln)] backdrop-blur-sm"
-        style={{ backgroundColor: 'var(--nav-blur)' }}
-      >
+      <header className="sticky top-0 z-20 border-b border-[var(--ln)] backdrop-blur-sm"
+        style={{ backgroundColor: 'var(--nav-blur)' }}>
         <div className="max-w-5xl mx-auto px-6 h-12 flex items-center justify-between gap-4">
 
-          <div className="flex items-center gap-1">
-            <button
-              onClick={goHome}
-              className="flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-[var(--sf2)] transition-colors"
-            >
-              <Logo size={18} />
-              <span className="text-[14px] font-semibold tracking-tight">DataDropAI</span>
+          {/* Left: logo + view switcher */}
+          <div className="flex items-center gap-3 min-w-0">
+            <button onClick={goHome}
+              className="flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-[var(--sf2)] transition-colors shrink-0">
+              <Logo size={17} />
+              <span className="text-[13px] font-semibold tracking-tight">DataDropAI</span>
             </button>
 
             {dataLoaded && (
               <>
-                <span className="text-[var(--ln3)] text-lg leading-none mx-0.5">/</span>
-                <div className="flex items-center gap-0.5">
-                  <button
-                    onClick={() => setView('explore')}
-                    className={`text-[12px] px-2.5 py-1 rounded-lg transition-colors ${
+                <span className="w-px h-3.5 bg-[var(--ln3)] shrink-0" />
+                {/* Segmented view control */}
+                <div className="flex items-center bg-[var(--sf2)] border border-[var(--ln)] rounded-lg p-0.5 shrink-0">
+                  <button onClick={() => setView('explore')}
+                    className={`text-[11px] font-medium px-3 py-1 rounded-md transition-colors ${
                       view === 'explore'
-                        ? 'bg-[var(--sf2)] text-[var(--t2)]'
+                        ? 'bg-[var(--sf3)] text-[var(--t1)]'
                         : 'text-[var(--t4)] hover:text-[var(--t2)]'
-                    }`}
-                  >
+                    }`}>
                     Explore
                   </button>
-                  <button
-                    onClick={() => setView('dashboard')}
-                    className={`text-[12px] px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1.5 ${
+                  <button onClick={() => setView('dashboard')}
+                    className={`text-[11px] font-medium px-3 py-1 rounded-md transition-colors flex items-center gap-1.5 ${
                       view === 'dashboard'
-                        ? 'bg-[var(--sf2)] text-[var(--t2)]'
+                        ? 'bg-[var(--sf3)] text-[var(--t1)]'
                         : 'text-[var(--t4)] hover:text-[var(--t2)]'
-                    }`}
-                  >
+                    }`}>
                     Dashboard
                     {pins.length > 0 && (
-                      <span className="bg-[#6366f1] text-white text-[9px] px-1.5 py-0.5 rounded-full leading-none font-medium">
+                      <span className="bg-[#6366f1] text-white text-[9px] w-4 h-4 rounded-full leading-none font-bold flex items-center justify-center tabular">
                         {pins.length}
                       </span>
                     )}
                   </button>
                 </div>
+
+                {/* Active file pill */}
+                <div className="hidden sm:flex items-center gap-1.5 bg-[var(--sf2)] border border-[var(--ln)] rounded-lg px-2.5 py-1 min-w-0 max-w-[180px]">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#6366f1] shrink-0" />
+                  <span className="text-[11px] text-[var(--t3)] truncate">{dataLabel}</span>
+                </div>
               </>
             )}
           </div>
 
-          <div className="flex items-center gap-2">
-            {dataLoaded && (
-              <span className="text-[11px] text-[var(--t5)] hidden sm:block max-w-[140px] truncate">{dataLabel}</span>
-            )}
+          {/* Right: alerts + help + theme + api key */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button onClick={() => setShowAlerts(true)} title="Alerts"
+              className={`relative w-7 h-7 flex items-center justify-center rounded-lg text-[13px] text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf2)] border border-transparent hover:border-[var(--ln2)] transition-all ${alertTriggered.length ? 'text-red-400' : ''}`}>
+              🔔
+              {alertTriggered.length > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-red-400 rounded-full border-2 border-[var(--bg)]" />
+              )}
+            </button>
+            <button onClick={() => setShowOnboarding(true)} title="Help (?) "
+              className="w-7 h-7 flex items-center justify-center rounded-lg text-[11px] font-semibold text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf2)] border border-transparent hover:border-[var(--ln2)] transition-all">
+              ?
+            </button>
             <ThemeToggle theme={theme} onToggle={toggleTheme} />
-            <input
-              type="password"
-              placeholder="Groq API key (optional)"
-              value={apiKey}
-              onChange={e => { setApiKey(e.target.value); localStorage.setItem('datadropai_key', e.target.value) }}
-              className="text-[11px] bg-[var(--sf)] border border-[var(--ln)] rounded-lg px-3 py-1.5 text-[var(--t3)] w-44 focus:outline-none focus:border-[#6366f1]/50 placeholder:text-[var(--t5)] transition-colors"
+            <ApiKeyPopover
+              apiKey={apiKey}
+              onApiKey={v => { setApiKey(v); localStorage.setItem('datadropai_key', v) }}
             />
           </div>
+
         </div>
       </header>
 
@@ -2178,6 +3860,8 @@ export default function App() {
         <Dashboard
           pins={pins}
           onUnpin={unpinChart}
+          onReorder={reorderPins}
+          onUpdateNote={updatePinNote}
           onClose={() => setView('explore')}
           colors={activeColors}
           theme={theme}
@@ -2188,7 +3872,7 @@ export default function App() {
 
       {/* Explore view */}
       {view === 'explore' && (
-        <main className="max-w-4xl mx-auto px-6 py-10 space-y-8">
+        <main className="max-w-4xl mx-auto px-6 pt-8 pb-36 space-y-8">
 
           {!dataLoaded ? (
             <div className="space-y-6">
@@ -2205,7 +3889,9 @@ export default function App() {
                   <p className="text-sm">Parsing file…</p>
                 </div>
               ) : (
-                <DataInput onCSV={loadCSV} onJSON={loadJSON} onURL={loadURL} onSample={loadSample} onFile={loadCSVFile} onFiles={loadCSVFiles} />
+                <DataInput onCSV={loadCSV} onJSON={loadJSON} onURL={loadURL} onSample={loadSample} onFile={loadCSVFile} onFiles={loadCSVFiles}
+                  onLiveReload={(url, secs) => { setLiveReloadUrl(url); setLiveReloadSecs(secs) }}
+                  onLiveReloadSecs={liveReloadSecs} />
               )}
             </div>
           ) : (
@@ -2220,6 +3906,15 @@ export default function App() {
                     <span className="text-[var(--t2)] font-medium">{dataLabel}</span>
                     <span className="text-[var(--t5)]">·</span>
                     <span>{rows.length.toLocaleString()} rows · {columns.length} columns</span>
+                    {lastUpdatedAt && (() => {
+                      const mins = Math.floor((Date.now() - lastUpdatedAt) / 60000)
+                      return (
+                        <span className="text-[var(--t5)] hidden sm:flex items-center gap-1">
+                          · <span className="w-1.5 h-1.5 rounded-full bg-[#10b981] inline-block" />
+                          {mins < 1 ? 'just now' : `${mins}m ago`}
+                        </span>
+                      )
+                    })()}
                     <span className="text-[var(--t5)] hidden sm:block truncate max-w-[260px]">
                       · {columns.map(c => c.name).join(', ')}
                     </span>
@@ -2261,10 +3956,22 @@ export default function App() {
                   <span>⚠</span> Re-upload your file to run new queries — raw data is never stored between sessions.
                 </p>
               )}
-              <button onClick={reset}
-                className="text-[11px] text-[var(--t5)] hover:text-[var(--t3)] transition-colors pl-1">
-                ← Load different data
-              </button>
+              <div className="flex items-center gap-3 pl-1">
+                <button onClick={reset}
+                  className="text-[11px] text-[var(--t5)] hover:text-[var(--t3)] transition-colors">
+                  ← Load different data
+                </button>
+                {rows.length > 0 && (
+                  <button onClick={exportAllData}
+                    className="text-[11px] text-[var(--t5)] hover:text-[var(--afg)] transition-colors flex items-center gap-1">
+                    <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+                      <path d="M6 1v7M3.5 5.5L6 8l2.5-2.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+                      <path d="M1 10h10" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+                    </svg>
+                    Download all {rows.length.toLocaleString()} rows
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -2279,8 +3986,208 @@ export default function App() {
             </div>
           )}
 
-          {/* Column stats strip */}
-          {dataLoaded && <StatsStrip rows={rows} columns={columns} />}
+          {/* Dataset details — collapsible */}
+          {dataLoaded && (
+            <div className="space-y-3">
+              <button
+                onClick={() => setShowDatasetDetails(v => !v)}
+                className="flex items-center gap-1.5 text-[11px] text-[var(--t4)] hover:text-[var(--t2)] transition-colors group"
+              >
+                <span className={`transition-transform duration-200 text-[9px] ${showDatasetDetails ? 'rotate-90' : ''}`}>▶</span>
+                <span>Dataset details</span>
+                {(() => {
+                  const hasFilters = Object.values(columnFilters).some(s => s.size > 0)
+                  const hasWhere = !!rowFilterExpr.trim()
+                  const badges = []
+                  if (hasFilters) badges.push('filter')
+                  if (hasWhere) badges.push('where')
+                  if (undoStack.length > 0) badges.push(`${undoStack.length} undo`)
+                  return badges.length > 0 ? (
+                    <span className="flex gap-1">
+                      {badges.map(b => (
+                        <span key={b} className="bg-[#6366f1]/15 text-[var(--afg)] text-[9px] px-1.5 py-0.5 rounded-full font-semibold leading-none">{b}</span>
+                      ))}
+                    </span>
+                  ) : null
+                })()}
+              </button>
+
+              {showDatasetDetails && (
+                <div className="space-y-4">
+                  <StatsStrip rows={rows} columns={columns} />
+
+                  {trends && trends.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {trends.map(t => {
+                        const up = t.pct >= 0
+                        const abs = Math.abs(t.pct)
+                        const label = abs >= 1000 ? '>999%' : `${abs.toFixed(1)}%`
+                        return (
+                          <div key={t.col}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[11px] font-medium ${
+                              up
+                                ? 'bg-[#10b981]/8 border-[#10b981]/20 text-[#10b981]'
+                                : 'bg-red-400/8 border-red-400/20 text-red-400'
+                            }`}>
+                            <span>{up ? '▲' : '▼'}</span>
+                            <span className="text-[var(--t2)] font-normal">{t.col}</span>
+                            <span>{up ? '+' : '-'}{label} vs prev period</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+
+                  <DatasetProfile profile={profile} loading={profileLoading} />
+                  <AnomalyPanel anomalies={anomalies} loading={anomaliesLoading} />
+
+                  {rows.length > 0 && (() => {
+                    const hasFilters = Object.values(columnFilters).some(s => s.size > 0)
+                    const filterCount = Object.values(columnFilters).reduce((n, s) => n + s.size, 0)
+                    const tbBtn = (active, onClick, children, extra = '') =>
+                      <button onClick={onClick}
+                        className={`text-[11px] font-medium px-2.5 py-1.5 rounded-lg transition-all ${extra} ${
+                          active
+                            ? 'bg-[#6366f1]/10 text-[var(--afg)]'
+                            : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'
+                        }`}>
+                        {children}
+                      </button>
+                    const sep = <span className="w-px h-3.5 bg-[var(--ln2)] mx-0.5 shrink-0" />
+                    return (
+                      <div className="flex items-center gap-0.5 bg-[var(--sf2)] border border-[var(--ln)] rounded-xl px-1.5 py-1.5 w-fit flex-wrap">
+                        {tbBtn(showFilterPanel || hasFilters, () => setShowFilterPanel(f => !f),
+                          <span className="flex items-center gap-1.5">
+                            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+                              <path d="M1 2.5h10M3 6h6M5 9.5h2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                            </svg>
+                            Filter
+                            {hasFilters && (
+                              <span className="bg-[#6366f1] text-white text-[9px] w-4 h-4 rounded-full flex items-center justify-center font-bold tabular">
+                                {filterCount}
+                              </span>
+                            )}
+                          </span>
+                        )}
+                        {tbBtn(showRowFilter || !!rowFilterExpr.trim(), () => setShowRowFilter(v => !v),
+                          <span className="flex items-center gap-1.5">
+                            <span className="font-mono text-[10px]">≥</span>
+                            Where
+                            {rowFilterExpr.trim() && (
+                              <span className="bg-[#6366f1] text-white text-[9px] px-1.5 py-0.5 rounded-full font-bold leading-none">on</span>
+                            )}
+                          </span>
+                        )}
+                        {tbBtn(showCalcCol, () => setShowCalcCol(c => !c),
+                          <span className="flex items-center gap-1.5">
+                            <span className="font-mono text-[10px]">ƒ</span>
+                            Calc
+                          </span>
+                        )}
+                        {sep}
+                        {tbBtn(false, runReport, reportLoading ? '···' : 'Report', reportLoading ? 'opacity-50 cursor-not-allowed' : '')}
+                        {tbBtn(false, () => setShowWorkspaces(true),
+                          <span className="flex items-center gap-1.5">
+                            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+                              <rect x="1" y="1" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3"/>
+                              <rect x="6.5" y="1" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3"/>
+                              <rect x="1" y="6.5" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3"/>
+                              <rect x="6.5" y="6.5" width="4.5" height="4.5" rx="1" stroke="currentColor" strokeWidth="1.3"/>
+                            </svg>
+                            Workspaces
+                          </span>
+                        )}
+                        {undoStack.length > 0 && (
+                          <>
+                            {sep}
+                            <button onClick={() => {
+                              setUndoStack(prev => {
+                                if (!prev.length) return prev
+                                const [last, ...rest] = prev
+                                setChartConfig(last.config)
+                                setChartData(last.data)
+                                setChartId(id => id + 1)
+                                return rest
+                              })
+                            }}
+                              className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg text-[var(--t4)] hover:text-amber-400 hover:bg-amber-400/8 transition-all flex items-center gap-1.5">
+                              <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+                                <path d="M2 4.5H7.5a3 3 0 010 6H5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+                                <path d="M2 4.5L4.5 2M2 4.5L4.5 7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+                              </svg>
+                              Undo
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Filter panel */}
+          {showFilterPanel && dataLoaded && rows.length > 0 && (
+            <FilterPanel
+              columns={columns}
+              rows={rows}
+              filters={columnFilters}
+              onFilters={setColumnFilters}
+              onClose={() => setShowFilterPanel(false)}
+            />
+          )}
+
+          {/* Row filter input */}
+          {showRowFilter && (
+            <div className="space-y-1.5">
+              <div className="flex gap-2 items-center">
+                <div className="relative flex-1">
+                  <input type="text" value={rowFilterExpr} onChange={e => setRowFilterExpr(e.target.value)}
+                    placeholder="e.g.  sales > 1000  ·  region = West  ·  growth >= 10 and growth <= 30"
+                    className="w-full bg-[var(--sf)] border border-[var(--ln2)] rounded-lg px-3 py-2 text-[12px] font-mono text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/50 transition-colors pr-8" />
+                  {rowFilterExpr && (
+                    <button onClick={() => setRowFilterExpr('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--t4)] hover:text-[var(--t2)] transition-colors text-[11px]">✕</button>
+                  )}
+                </div>
+              </div>
+              {rowFilterExpr.trim() && rows.length > 0 && (() => {
+                const matched = applyRowFilter(rows, rowFilterExpr).length
+                return (
+                  <p className="text-[11px] text-[var(--t4)] pl-1">
+                    <span className={matched === 0 ? 'text-red-400' : 'text-[var(--afg)]'}>{matched.toLocaleString()}</span>
+                    {' '}of {rows.length.toLocaleString()} rows match — AI queries will use only these rows
+                  </p>
+                )
+              })()}
+            </div>
+          )}
+
+          {/* Calculated column input */}
+          {showCalcCol && (
+            <div className="flex gap-2 items-center">
+              <input type="text" value={calcColExpr} onChange={e => setCalcColExpr(e.target.value)}
+                placeholder="e.g. sales * 1.1  or  Math.round(price / qty)"
+                onKeyDown={e => e.key === 'Enter' && addCalculatedColumn(calcColExpr)}
+                className="flex-1 bg-[var(--sf)] border border-[var(--ln2)] rounded-lg px-3 py-2 text-[12px] font-mono text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none focus:border-[#6366f1]/50 transition-colors" />
+              <button onClick={() => addCalculatedColumn(calcColExpr)} disabled={!calcColExpr.trim()}
+                className="bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-30 text-white text-[12px] px-4 py-2 rounded-lg transition-colors whitespace-nowrap">
+                Add column
+              </button>
+            </div>
+          )}
+
+          {/* Smart Overview — headline + insights + questions, shown before first real query */}
+          {dataLoaded && !hasQueried && (overviewLoading || smartOverview) && (
+            <SmartOverview
+              overview={smartOverview}
+              loading={overviewLoading}
+              anomalies={anomalies}
+              onQuestion={q => { setQuery(q); runQuery(q) }}
+              onShowAnomalies={() => setShowDatasetDetails(true)}
+            />
+          )}
 
           {/* Rate limit banner */}
           {rateLimitLeft > 0 && (
@@ -2301,71 +4208,7 @@ export default function App() {
             </div>
           )}
 
-          {/* Query bar */}
-          {dataLoaded && (
-            <div className="space-y-2.5">
-              <div className="relative">
-                <input
-                  ref={queryInputRef}
-                  type="text"
-                  placeholder='Ask a question, e.g. "bar chart of sales by country"'
-                  value={query}
-                  onChange={e => setQuery(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && !rateLimitLeft && runQuery(query)}
-                  className="w-full bg-[var(--sf)] border border-[var(--ln2)] focus:border-[#6366f1]/60 rounded-xl px-5 py-4 text-[14px] text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none transition-colors pr-24"
-                />
-                {query && !loading && (
-                  <button onClick={() => setQuery('')}
-                    className="absolute right-[4.5rem] top-1/2 -translate-y-1/2 text-[var(--t4)] hover:text-[var(--t2)] transition-colors p-1">
-                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-                      <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-                    </svg>
-                  </button>
-                )}
-                <button
-                  onClick={() => runQuery(query)}
-                  disabled={loading || !query.trim() || rateLimitLeft > 0}
-                  title={rateLimitLeft > 0 ? `Rate limited — ${rateLimitLeft}s remaining` : undefined}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-25 disabled:cursor-not-allowed text-white text-[12px] font-medium px-4 py-1.5 rounded-lg transition-colors"
-                >
-                  {loading ? '···' : 'Ask'}
-                </button>
-              </div>
-              <div className="flex flex-wrap gap-1.5 items-center">
-                {suggestionsLoading && !suggestions.length
-                  ? CHIPS.map(chip => (
-                      <div key={chip}
-                        className="h-6 rounded-full bg-[var(--sf)] border border-[var(--ln)] animate-pulse"
-                        style={{ width: `${chip.length * 7 + 24}px` }} />
-                    ))
-                  : (suggestions.length ? suggestions : CHIPS).map(chip => (
-                      <button key={chip} onClick={() => { setQuery(chip); runQuery(chip) }}
-                        className="text-[11px] bg-[var(--sf)] border border-[var(--ln)] hover:border-[var(--ln3)] text-[var(--t4)] hover:text-[var(--t2)] px-3 py-1 rounded-full transition-colors">
-                        {chip}
-                      </button>
-                    ))
-                }
-                <span className="text-[10px] text-[var(--t5)] ml-auto hidden sm:block">⌘K to focus</span>
-              </div>
-            </div>
-          )}
-
-          {/* Loading skeleton */}
-          {loading && (
-            <div className="space-y-3">
-              {loadingMsg && (
-                <div className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[#6366f1] animate-pulse" />
-                  <span className="text-[12px] text-[var(--t3)]">{loadingMsg}</span>
-                </div>
-              )}
-              <div className="animate-pulse space-y-3">
-                <div className="h-3.5 bg-[var(--sf2)] rounded w-40" />
-                <div className="h-[360px] bg-[var(--sf)] rounded-2xl border border-[var(--ln)]" />
-                <div className="h-3 bg-[var(--sf2)] rounded w-64" />
-              </div>
-            </div>
-          )}
+          {/* Query bar is now sticky bottom — see below */}
 
           {/* Error */}
           {error && !loading && (
@@ -2374,177 +4217,376 @@ export default function App() {
             </div>
           )}
 
+          {/* Chart hidden strip */}
+          {chartConfig && chartHidden && (
+            <div className="flex items-center justify-between bg-[var(--sf2)] border border-[var(--ln)] rounded-xl px-4 py-2.5">
+              <span className="text-[12px] text-[var(--t4)] truncate mr-3">{chartConfig.title || 'Chart'}</span>
+              <button onClick={() => setChartHidden(false)}
+                className="text-[11px] text-[var(--afg)] hover:text-[var(--t1)] transition-colors whitespace-nowrap shrink-0">
+                Show chart
+              </button>
+            </div>
+          )}
+
           {/* Chart card */}
-          {chartConfig && !loading && (
-            <div ref={chartRef} className="bg-[var(--sf)] border border-[var(--ln)] rounded-2xl p-6 space-y-5 chart-fade-in">
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <h2 className="text-[15px] font-semibold text-[var(--t1)] leading-snug">{chartConfig.title}</h2>
-                  <span className="text-[10px] bg-[#6366f1]/10 text-[var(--afg)] px-2 py-0.5 rounded-md mt-1.5 inline-block font-medium tracking-wide uppercase">
-                    {CHART_LABEL[chartConfig.chartType] || chartConfig.chartType}
-                  </span>
-                </div>
-                <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
-                  {/* Chart / Table toggle */}
-                  <div className="flex items-center bg-[var(--sf2)] border border-[var(--ln2)] rounded-lg p-0.5 mr-1">
-                    {['chart', 'table'].map(v => (
-                      <button key={v} onClick={() => setChartView(v)}
-                        className={`text-[11px] px-2.5 py-1 rounded-md transition-colors capitalize ${
-                          chartView === v
-                            ? 'bg-[var(--sf)] text-[var(--t1)] shadow-sm'
-                            : 'text-[var(--t4)] hover:text-[var(--t2)]'
-                        }`}>
-                        {v}
-                      </button>
-                    ))}
+          {chartConfig && !chartHidden && (() => {
+            const followUpChips = getFollowUps(chartConfig, columns)
+            const hasInsight = chartConfig.answerType !== 'insight' && !!chartConfig.insight
+            return (
+              <div ref={chartRef} className={`bg-[var(--sf)] border border-[var(--ln)] rounded-2xl overflow-hidden chart-fade-in ${focusMode ? 'ring-2 ring-[#6366f1]/20' : ''}`} style={{ boxShadow: 'var(--shadow-md)' }}>
+
+                {/* ── Header ── */}
+                <div className="flex items-start justify-between gap-4 px-5 pt-5 pb-4">
+                  <div className="min-w-0">
+                    {editingTitle ? (
+                      <input
+                        autoFocus
+                        value={titleDraft}
+                        onChange={e => setTitleDraft(e.target.value)}
+                        onBlur={() => { setChartConfig(c => ({ ...c, title: titleDraft })); setEditingTitle(false) }}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') { setChartConfig(c => ({ ...c, title: titleDraft })); setEditingTitle(false) }
+                          if (e.key === 'Escape') setEditingTitle(false)
+                        }}
+                        className="text-[15px] font-semibold text-[var(--t1)] bg-transparent border-b-2 border-[#6366f1] focus:outline-none w-full leading-snug"
+                      />
+                    ) : (
+                      <h2
+                        onClick={() => { setEditingTitle(true); setTitleDraft(chartConfig.title) }}
+                        title="Click to rename"
+                        className="text-[15px] font-semibold text-[var(--t1)] leading-snug cursor-text hover:opacity-80 transition-opacity"
+                      >
+                        {chartConfig.title}
+                      </h2>
+                    )}
+                    {chartConfig.chartType && !focusMode && (
+                      <span className="text-[10px] bg-[#6366f1]/10 text-[var(--afg)] px-2 py-0.5 rounded-md mt-1.5 inline-block font-semibold tracking-widest uppercase">
+                        {CHART_LABEL[chartConfig.chartType] || chartConfig.chartType}
+                      </span>
+                    )}
                   </div>
-                  {/* Fullscreen */}
-                  <button onClick={() => setFullscreen(true)} title="Fullscreen"
-                    className="flex items-center justify-center w-7 h-7 bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] rounded-lg transition-colors">
-                    <FullscreenIcon />
-                  </button>
-                  {/* Palette */}
-                  <PalettePicker palette={palette} onPalette={setPalette} />
-                  {/* Regenerate */}
-                  <button onClick={() => runQuery(query)} disabled={loading || !query.trim() || !rows.length}
-                    title="Re-run this query"
-                    className="text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] disabled:opacity-30 disabled:cursor-not-allowed text-[var(--t3)] hover:text-[var(--t1)] px-2.5 py-1.5 rounded-lg transition-colors">
-                    ↻
-                  </button>
-                  {/* Share */}
-                  <button onClick={shareChart}
-                    className="text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap">
-                    {copied ? '✓ Copied' : 'Share'}
-                  </button>
-                  {/* Pin */}
-                  <button onClick={pinChart} disabled={isPinned()}
-                    className={`text-[11px] border px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
-                      isPinned()
-                        ? 'bg-[#6366f1]/8 border-[#6366f1]/20 text-[var(--afg)] cursor-default'
-                        : 'bg-[var(--sf2)] border-[var(--ln2)] hover:border-[#6366f1]/40 text-[var(--t3)] hover:text-[var(--t1)]'
-                    }`}>
-                    {isPinned() ? 'Pinned' : 'Pin'}
-                  </button>
-                  {/* Export dropdown */}
-                  <div className="relative" ref={exportMenuRef}>
-                    <button onClick={() => setExportOpen(o => !o)}
-                      className="flex items-center gap-1 text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] px-3 py-1.5 rounded-lg transition-colors">
-                      Export
-                      <span className="text-[9px] opacity-60">▾</span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button onClick={() => setChartHidden(true)}
+                      title="Hide chart"
+                      className="text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap">
+                      Hide
                     </button>
-                    {exportOpen && (
-                      <div className="absolute right-0 top-full mt-1 bg-[var(--sf)] border border-[var(--ln2)] rounded-xl shadow-xl z-40 py-1.5 min-w-[148px]">
-                        <button onClick={() => { exportPNG(); setExportOpen(false) }}
-                          className="w-full px-3.5 py-2 text-[12px] text-left text-[var(--t3)] hover:text-[var(--t1)] hover:bg-[var(--sf2)] transition-colors">
-                          PNG image
-                        </button>
-                        <button onClick={() => { exportCSV(); setExportOpen(false) }}
-                          className="w-full px-3.5 py-2 text-[12px] text-left text-[var(--t3)] hover:text-[var(--t1)] hover:bg-[var(--sf2)] transition-colors">
-                          CSV data
-                        </button>
-                        <button onClick={() => { copyDataJSON(); setExportOpen(false) }}
-                          className="w-full px-3.5 py-2 text-[12px] text-left text-[var(--t3)] hover:text-[var(--t1)] hover:bg-[var(--sf2)] transition-colors">
-                          Copy as JSON
-                        </button>
-                        <div className="border-t border-[var(--ln)] my-1" />
-                        <label className="flex items-center gap-2 px-3.5 py-1.5 cursor-pointer group">
-                          <input type="checkbox" checked={watermark} onChange={e => setWatermark(e.target.checked)}
-                            className="accent-[#6366f1] cursor-pointer" />
-                          <span className="text-[11px] text-[var(--t4)] group-hover:text-[var(--t3)] transition-colors">Watermark</span>
-                        </label>
+                    <button onClick={shareChart}
+                      className="text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap">
+                      {copied ? '✓ Copied' : 'Share'}
+                    </button>
+                    <button onClick={pinChart} disabled={isPinned()}
+                      className={`text-[11px] border px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap ${
+                        isPinned()
+                          ? 'bg-[#6366f1]/10 border-[#6366f1]/25 text-[var(--afg)] cursor-default'
+                          : 'bg-[var(--sf2)] border-[var(--ln2)] hover:border-[#6366f1]/35 text-[var(--t3)] hover:text-[var(--afg)]'
+                      }`}>
+                      {isPinned() ? '✓ Pinned' : 'Pin'}
+                    </button>
+                    <div className="relative" ref={exportMenuRef}>
+                      <button onClick={() => setExportOpen(o => !o)}
+                        className="flex items-center gap-1 text-[11px] bg-[var(--sf2)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] px-3 py-1.5 rounded-lg transition-colors">
+                        Export <span className="text-[9px] opacity-50">▾</span>
+                      </button>
+                      {exportOpen && (
+                        <div className="absolute right-0 top-full mt-1.5 bg-[var(--sf3)] border border-[var(--ln2)] rounded-xl z-40 py-1.5 min-w-[152px]" style={{ boxShadow: 'var(--shadow-lg)' }}>
+                          {[
+                            ['PNG image',       () => { exportPNG();       setExportOpen(false) }],
+                            ['SVG vector',      () => { exportSVG();       setExportOpen(false) }],
+                            ['CSV data',        () => { exportCSV();       setExportOpen(false) }],
+                            ['Excel (.xlsx)',   () => { exportXLSX();      setExportOpen(false) }],
+                            ['Copy as JSON',    () => { copyDataJSON();    setExportOpen(false) }],
+                            ['Copy embed code', () => { copyEmbedCode();   setExportOpen(false) }],
+                          ].map(([label, fn]) => (
+                            <button key={label} onClick={fn}
+                              className="w-full px-3.5 py-2 text-[12px] text-left text-[var(--t3)] hover:text-[var(--t1)] hover:bg-[var(--sf2)] transition-colors">
+                              {label}
+                            </button>
+                          ))}
+                          <div className="border-t border-[var(--ln)] my-1" />
+                          <label className="flex items-center gap-2 px-3.5 py-1.5 cursor-pointer group">
+                            <input type="checkbox" checked={watermark} onChange={e => setWatermark(e.target.checked)}
+                              className="accent-[#6366f1] cursor-pointer" />
+                            <span className="text-[11px] text-[var(--t4)] group-hover:text-[var(--t3)] transition-colors">Watermark</span>
+                          </label>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Toolbar + Axis controls (hidden in focus mode) ── */}
+                {!focusMode && <>
+                <div className="flex items-center gap-2 px-4 py-2 border-y border-[var(--ln)] bg-[var(--sf2)]" style={{ scrollbarWidth: 'none' }}>
+                  {/* Chart type dropdown */}
+                  <div className="relative shrink-0">
+                    <button
+                      onClick={() => setChartTypeOpen(o => !o)}
+                      className="flex items-center gap-1.5 text-[11px] font-medium bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t2)] px-3 py-1.5 rounded-lg transition-colors"
+                    >
+                      <span className="text-[var(--afg)] font-semibold">{CHART_LABEL[chartConfig.chartType] || chartConfig.chartType}</span>
+                      <span className="text-[9px] text-[var(--t4)]">▾</span>
+                    </button>
+                    {chartTypeOpen && (
+                      <div className="absolute left-0 top-full mt-1.5 bg-[var(--sf3)] border border-[var(--ln2)] rounded-xl z-40 py-1.5 grid grid-cols-2 min-w-[140px]" style={{ boxShadow: 'var(--shadow-lg)' }}>
+                        {Object.entries(CHART_LABEL).map(([type, label]) => (
+                          <button key={type}
+                            onClick={() => { switchChartType(type); setChartTypeOpen(false) }}
+                            className={`text-left px-3.5 py-1.5 text-[12px] transition-colors ${
+                              chartConfig.chartType === type
+                                ? 'text-[var(--afg)] font-semibold'
+                                : 'text-[var(--t3)] hover:text-[var(--t1)] hover:bg-[var(--sf2)]'
+                            }`}>
+                            {label}
+                          </button>
+                        ))}
                       </div>
                     )}
                   </div>
-                </div>
-              </div>
 
-              {/* Chart type switcher strip */}
-              <div className="flex items-center gap-2">
-                <div className="flex gap-1 overflow-x-auto flex-1" style={{ scrollbarWidth: 'none' }}>
-                  {Object.entries(CHART_LABEL).map(([type, label]) => (
-                    <button key={type} onClick={() => switchChartType(type)}
-                      className={`shrink-0 text-[10px] font-medium px-2.5 py-1 rounded-md border transition-all ${
-                        chartConfig.chartType === type
-                          ? 'bg-[#6366f1]/12 border-[#6366f1]/25 text-[var(--afg)]'
-                          : 'border-[var(--ln)] text-[var(--t4)] hover:text-[var(--t2)] hover:border-[var(--ln3)]'
-                      }`}>
-                      {label}
+                  {/* Right-side controls */}
+                  <div className="ml-auto flex items-center gap-1 shrink-0">
+                    {/* Overlay toggles */}
+                    {['bar','line','area','composed'].includes(chartConfig.chartType) && (
+                      <button onClick={() => setShowAvgLine(v => !v)}
+                        className={`text-[10px] font-medium px-2 py-1 rounded-md transition-all ${showAvgLine ? 'bg-[#6366f1]/12 text-[var(--afg)]' : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'}`}>
+                        Avg
+                      </button>
+                    )}
+                    {['bar','funnel'].includes(chartConfig.chartType) && (
+                      <button onClick={() => setShowDataLabels(v => !v)}
+                        className={`text-[10px] font-medium px-2 py-1 rounded-md transition-all ${showDataLabels ? 'bg-[#6366f1]/12 text-[var(--afg)]' : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'}`}>
+                        Labels
+                      </button>
+                    )}
+                    {['line','area','scatter'].includes(chartConfig.chartType) && (
+                      <button onClick={() => setShowTrendLine(v => !v)}
+                        className={`text-[10px] font-medium px-2 py-1 rounded-md transition-all ${showTrendLine ? 'bg-[#6366f1]/12 text-[var(--afg)]' : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'}`}>
+                        Trend
+                      </button>
+                    )}
+                    {['line','area'].includes(chartConfig.chartType) && (
+                      <button onClick={() => setForecastPeriods(f => f > 0 ? 0 : 6)}
+                        className={`text-[10px] font-medium px-2 py-1 rounded-md transition-all ${forecastPeriods > 0 ? 'bg-[#6366f1]/12 text-[var(--afg)]' : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'}`}>
+                        +6 Fcst
+                      </button>
+                    )}
+                    {chartConfig.chartType === 'bar' &&
+                      (chartConfig.groupBy || (Array.isArray(chartConfig.yAxis) && chartConfig.yAxis.length > 1)) && (
+                      <button onClick={() => setStackedBar(v => !v)}
+                        className={`text-[10px] font-medium px-2 py-1 rounded-md transition-all ${stackedBar ? 'bg-[#6366f1]/12 text-[var(--afg)]' : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'}`}>
+                        Stack
+                      </button>
+                    )}
+                    {chartConfig.chartType === 'composed' && (
+                      <button onClick={() => setShowDualYAxis(v => !v)}
+                        className={`text-[10px] font-medium px-2 py-1 rounded-md transition-all ${showDualYAxis ? 'bg-[#6366f1]/12 text-[var(--afg)]' : 'text-[var(--t4)] hover:text-[var(--t2)] hover:bg-[var(--sf3)]'}`}>
+                        Dual Y
+                      </button>
+                    )}
+
+                    <span className="w-px h-3.5 bg-[var(--ln2)] mx-1 shrink-0" />
+
+                    {/* View toggle */}
+                    <div className="flex items-center bg-[var(--sf)] border border-[var(--ln2)] rounded-lg p-0.5">
+                      {['chart','table'].map(v => (
+                        <button key={v} onClick={() => setChartView(v)}
+                          className={`text-[10px] px-2.5 py-1 rounded-md transition-colors capitalize ${
+                            chartView === v ? 'bg-[var(--sf3)] text-[var(--t1)]' : 'text-[var(--t4)] hover:text-[var(--t2)]'
+                          }`}>
+                          {v}
+                        </button>
+                      ))}
+                    </div>
+
+                    <span className="w-px h-3.5 bg-[var(--ln2)] mx-1 shrink-0" />
+
+                    <PalettePicker palette={palette} onPalette={setPalette} />
+                    <button onClick={() => runQuery(query)} disabled={loading || !query.trim() || !rows.length}
+                      title="Re-run query"
+                      className="flex items-center justify-center w-7 h-7 bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] disabled:opacity-30 text-[var(--t3)] hover:text-[var(--t1)] rounded-lg transition-colors text-[13px]">
+                      ↻
                     </button>
-                  ))}
-                </div>
-                {['bar', 'line', 'area', 'composed'].includes(chartConfig.chartType) && (
-                  <button onClick={() => setShowAvgLine(v => !v)}
-                    title="Toggle average reference line"
-                    className={`shrink-0 text-[10px] font-medium px-2.5 py-1 rounded-md border transition-all ${
-                      showAvgLine
-                        ? 'bg-[#6366f1]/12 border-[#6366f1]/25 text-[var(--afg)]'
-                        : 'border-[var(--ln)] text-[var(--t4)] hover:text-[var(--t2)] hover:border-[var(--ln3)]'
-                    }`}>
-                    Avg
-                  </button>
-                )}
-                <span className="text-[10px] text-[var(--t5)] shrink-0 ml-1">
-                  {chartData.length} pts
-                </span>
-              </div>
+                    <button onClick={() => setFullscreen(true)} title="Fullscreen (F)"
+                      className="flex items-center justify-center w-7 h-7 bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] rounded-lg transition-colors">
+                      <FullscreenIcon />
+                    </button>
 
-              {sampledNotice && (
-                <div className="text-[11px] text-[var(--t4)] bg-[var(--sf2)] border border-[var(--ln)] rounded-lg px-3 py-1.5 flex items-center gap-1.5">
-                  <span className="text-[var(--afg)]">↓</span>
-                  Showing {sampledNotice.shown.toLocaleString()} sampled from {sampledNotice.total.toLocaleString()} aggregated points
-                </div>
-              )}
-
-              {chartView === 'chart'
-                ? (
-                  <ChartErrorBoundary key={chartId}>
-                    <ChartRenderer config={chartConfig} data={chartData} columns={columns} colors={activeColors} showAvgLine={showAvgLine} />
-                  </ChartErrorBoundary>
-                )
-                : <DataTable data={chartData} />
-              }
-
-              {chartConfig.insight && (
-                <div className="border-t border-[var(--ln)] pt-4">
-                  <div className="flex gap-2.5 bg-[#6366f1]/4 border border-[#6366f1]/10 rounded-xl px-3.5 py-3">
-                    <span className="text-[var(--afg)] text-[13px] mt-0.5 shrink-0">↳</span>
-                    <p className="text-[12px] text-[var(--t2)] leading-relaxed">{chartConfig.insight}</p>
+                    <span className="text-[10px] text-[var(--t5)] ml-1 tabular shrink-0">{chartData.length} pts</span>
                   </div>
                 </div>
-              )}
 
-              <div className="border-t border-[var(--ln)] pt-4 space-y-2.5">
-                {/* Smart follow-up chips */}
-                <div className="flex flex-wrap gap-1.5">
-                  {getFollowUps(chartConfig, columns).map(q => (
-                    <button key={q}
-                      onClick={() => { setFollowUp(q); runQuery(q) }}
-                      className="text-[11px] bg-[#6366f1]/5 border border-[#6366f1]/15 hover:border-[#6366f1]/35 text-[var(--afg)] hover:bg-[#6366f1]/10 px-3 py-1 rounded-full transition-colors">
-                      {q}
-                    </button>
-                  ))}
+                {/* ── Axis controls ── */}
+                {!['pie','donut','heatmap','scatter','bubble','funnel'].includes(chartConfig.chartType) && (
+                  <div className="flex items-center gap-3 px-4 py-2 border-b border-[var(--ln)] bg-[var(--sf2)] overflow-x-auto" style={{ scrollbarWidth: 'none' }}>
+                    {[
+                      { label: 'X', field: 'xAxis', opts: columns.map(c => c.name), current: chartConfig.xAxis },
+                      { label: 'Y', field: 'yAxis', opts: columns.filter(c => c.type === 'numeric').map(c => c.name), current: Array.isArray(chartConfig.yAxis) ? chartConfig.yAxis[0] : chartConfig.yAxis },
+                    ].map(({ label, field, opts, current }) => (
+                      <label key={field} className="flex items-center gap-1.5 shrink-0">
+                        <span className="text-[10px] font-semibold text-[var(--t5)] uppercase tracking-wider w-3">{label}</span>
+                        <select
+                          value={current || ''}
+                          onChange={e => updateAxis(field, e.target.value)}
+                          className="bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] rounded-lg px-2 py-1 text-[11px] text-[var(--t2)] focus:outline-none cursor-pointer transition-colors max-w-[140px] truncate"
+                        >
+                          {opts.map(o => <option key={o} value={o}>{o}</option>)}
+                        </select>
+                      </label>
+                    ))}
+                    <label className="flex items-center gap-1.5 shrink-0">
+                      <span className="text-[10px] font-semibold text-[var(--t5)] uppercase tracking-wider">Group</span>
+                      <select
+                        value={chartConfig.groupBy || ''}
+                        onChange={e => updateAxis('groupBy', e.target.value || null)}
+                        className="bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] rounded-lg px-2 py-1 text-[11px] text-[var(--t2)] focus:outline-none cursor-pointer transition-colors max-w-[120px]"
+                      >
+                        <option value="">None</option>
+                        {columns.filter(c => c.type === 'categorical').map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-1.5 shrink-0">
+                      <span className="text-[10px] font-semibold text-[var(--t5)] uppercase tracking-wider">Agg</span>
+                      <select
+                        value={chartConfig.aggregation || 'none'}
+                        onChange={e => updateAxis('aggregation', e.target.value)}
+                        className="bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] rounded-lg px-2 py-1 text-[11px] text-[var(--t2)] focus:outline-none cursor-pointer transition-colors"
+                      >
+                        {['sum','avg','count','none'].map(a => <option key={a} value={a}>{a}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                )}
+                </>}
+
+                {/* Sampled notice */}
+                {sampledNotice && (
+                  <div className="mx-5 mt-4 text-[11px] text-[var(--t4)] bg-[var(--sf2)] border border-[var(--ln)] rounded-lg px-3 py-1.5 flex items-center gap-1.5">
+                    <span className="text-[var(--afg)] text-[10px]">↓</span>
+                    Showing {sampledNotice.shown.toLocaleString()} of {sampledNotice.total.toLocaleString()} points
+                  </div>
+                )}
+
+                {/* ── Chart body ── */}
+                <div className="px-5 py-5">
+                  {loading ? (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#6366f1] animate-pulse shrink-0" />
+                        <span className="text-[12px] text-[var(--t3)]">{loadingMsg || 'Analyzing your data…'}</span>
+                      </div>
+                      {streamingText ? (
+                        <div className="relative bg-[var(--sf2)] border border-[var(--ln)] rounded-xl px-4 py-3 min-h-[120px] max-h-[280px] overflow-y-auto">
+                          <p className="text-[10px] text-[var(--t5)] uppercase tracking-widest font-semibold mb-2">Live output</p>
+                          <pre className="text-[11px] text-[var(--t3)] font-mono whitespace-pre-wrap break-all leading-relaxed">{streamingText}<span className="inline-block w-[2px] h-[13px] bg-[#6366f1] ml-0.5 align-text-bottom animate-pulse" /></pre>
+                        </div>
+                      ) : (
+                        <div className="h-[360px] bg-[var(--sf2)] rounded-xl animate-pulse" />
+                      )}
+                    </div>
+                  ) : chartConfig.answerType === 'insight' ? (
+                    <div className="bg-[#6366f1]/5 border border-[#6366f1]/12 rounded-xl px-5 py-5">
+                      <p className="text-[10px] font-semibold text-[var(--afg)] uppercase tracking-widest mb-2.5">Answer</p>
+                      <p className="text-[15px] text-[var(--t1)] leading-relaxed font-medium">{chartConfig.answer}</p>
+                    </div>
+                  ) : chartView === 'chart' ? (
+                    <ChartErrorBoundary key={chartId}>
+                      <ChartRenderer config={chartConfig} data={chartData} columns={columns} colors={activeColors}
+                        showAvgLine={showAvgLine} showDataLabels={showDataLabels} showTrendLine={showTrendLine}
+                        forecastPeriods={forecastPeriods} showDualYAxis={showDualYAxis} stackedBar={stackedBar} />
+                    </ChartErrorBoundary>
+                  ) : (
+                    <DataTable data={chartData} />
+                  )}
                 </div>
-                {/* Free-form refine */}
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="Or type a refinement…"
-                    value={followUp}
-                    onChange={e => setFollowUp(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter' && followUp.trim()) { runQuery(followUp); setFollowUp('') } }}
-                    className="flex-1 bg-[var(--bg)] border border-[var(--ln2)] focus:border-[#6366f1]/40 rounded-xl px-4 py-2.5 text-[13px] text-[var(--t1)] placeholder:text-[var(--t5)] focus:outline-none transition-colors"
-                  />
-                  <button
-                    onClick={() => { if (followUp.trim()) { runQuery(followUp); setFollowUp('') } }}
-                    disabled={!followUp.trim()}
-                    className="text-[12px] bg-[var(--bg)] border border-[var(--ln2)] hover:border-[var(--ln3)] disabled:opacity-30 text-[var(--t3)] hover:text-[var(--t1)] px-4 py-2.5 rounded-xl transition-colors whitespace-nowrap"
-                  >
-                    Refine
-                  </button>
+
+                {/* ── Footer — insight + follow-ups ── */}
+                <div className="border-t border-[var(--ln)] bg-[var(--sf2)]">
+                  {hasInsight && (
+                    <div className="px-5 pt-4 pb-3">
+                      <div className="flex items-start gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5 mb-1.5">
+                            <span className="w-1 h-1 rounded-full bg-[var(--afg)] shrink-0" />
+                            <p className="text-[10px] font-semibold text-[var(--afg)] uppercase tracking-widest">Insight</p>
+                          </div>
+                          <p className="text-[12px] text-[var(--t2)] leading-relaxed"><FormatInsight text={chartConfig.insight} /></p>
+                          {(explanation || explanationLoading) && (
+                            <p className="text-[12px] text-[var(--t3)] leading-relaxed mt-2 pl-3 border-l-2 border-[#6366f1]/20">
+                              {explanationLoading ? <span className="animate-pulse">Explaining…</span> : explanation}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex flex-col gap-1 shrink-0">
+                          <button onClick={() => { const next = !eli5Mode; setEli5Mode(next); runExplain(next) }}
+                            disabled={explanationLoading}
+                            title={eli5Mode ? 'Switch to analyst mode' : 'Explain Like I\'m 5'}
+                            className={`text-[10px] font-medium px-2.5 py-1.5 rounded-lg border transition-all whitespace-nowrap disabled:opacity-40 ${
+                              eli5Mode
+                                ? 'bg-[#f59e0b]/10 border-[#f59e0b]/30 text-[#f59e0b]'
+                                : 'border-[var(--ln2)] hover:border-[#6366f1]/35 text-[var(--t4)] hover:text-[var(--afg)]'
+                            }`}>
+                            {eli5Mode ? '🧒 ELI5' : '✦ Explain'}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {/* Explanation for charts that have no separate insight field */}
+                  {!hasInsight && (explanation || explanationLoading) && chartConfig.answerType !== 'insight' && (
+                    <div className="mx-5 mb-0 flex items-start gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="w-1 h-1 rounded-full bg-[var(--afg)] shrink-0" />
+                          <p className="text-[10px] font-semibold text-[var(--afg)] uppercase tracking-widest">Explanation</p>
+                        </div>
+                        <p className="text-[12px] text-[var(--t3)] leading-relaxed">
+                          {explanationLoading ? <span className="animate-pulse">Analyzing…</span> : explanation}
+                        </p>
+                      </div>
+                      <button onClick={() => { const next = !eli5Mode; setEli5Mode(next); runExplain(next) }}
+                        disabled={explanationLoading}
+                        className={`shrink-0 text-[10px] font-medium px-2.5 py-1.5 rounded-lg border transition-all whitespace-nowrap disabled:opacity-40 ${
+                          eli5Mode ? 'bg-[#f59e0b]/10 border-[#f59e0b]/30 text-[#f59e0b]' : 'border-[var(--ln2)] hover:border-[#6366f1]/35 text-[var(--t4)] hover:text-[var(--afg)]'
+                        }`}>
+                        {eli5Mode ? '🧒 ELI5' : '✦ ELI5'}
+                      </button>
+                    </div>
+                  )}
+                  {!focusMode && (
+                    <div className={`px-5 pb-4 space-y-2.5 ${hasInsight || (!hasInsight && (explanation || explanationLoading)) ? 'border-t border-[var(--ln)] pt-3 mt-4' : 'pt-4'}`}>
+                      {followUpChips.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {followUpChips.map(q => (
+                            <button key={q} onClick={() => { setFollowUp(q); runQuery(q) }}
+                              className="text-[11px] bg-[#6366f1]/5 border border-[#6366f1]/15 hover:border-[#6366f1]/30 text-[var(--afg)] hover:bg-[#6366f1]/10 px-3 py-1 rounded-full transition-colors">
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          placeholder="Ask a follow-up…"
+                          value={followUp}
+                          onChange={e => setFollowUp(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter' && followUp.trim()) { runQuery(followUp); setFollowUp('') } }}
+                          className="flex-1 bg-[var(--sf)] border border-[var(--ln2)] focus:border-[#6366f1]/40 rounded-xl px-4 py-2 text-[12px] text-[var(--t1)] placeholder:text-[var(--t4)] focus:outline-none transition-colors"
+                        />
+                        <button onClick={() => { if (followUp.trim()) { runQuery(followUp); setFollowUp('') } }}
+                          disabled={!followUp.trim()}
+                          className="text-[12px] bg-[var(--sf)] border border-[var(--ln2)] hover:border-[var(--ln3)] disabled:opacity-30 text-[var(--t3)] hover:text-[var(--t1)] px-4 py-2 rounded-xl transition-colors whitespace-nowrap">
+                          Ask
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
+
               </div>
-            </div>
-          )}
+            )
+          })()}
 
           {/* History strip */}
           {dataLoaded && (
@@ -2552,6 +4594,126 @@ export default function App() {
           )}
 
         </main>
+      )}
+
+      {/* Sticky bottom query bar — visible when data is loaded in explore view */}
+      {view === 'explore' && dataLoaded && (
+        <>
+          {/* Dim backdrop when input is focused */}
+          {queryFocused && (
+            <div
+              className="fixed inset-0 z-20 bg-[var(--bg)]/70 backdrop-blur-[3px]"
+              onMouseDown={() => {
+                setQueryFocused(false)
+                setFocusMode(false)
+                queryInputRef.current?.blur()
+              }}
+            />
+          )}
+
+          <div className="fixed bottom-0 left-0 right-0 z-30 border-t border-[var(--ln)] bg-[var(--bg)]/95 backdrop-blur-md">
+            <div className="max-w-4xl mx-auto px-6 py-3 space-y-2">
+
+              {/* ── Expanded suggestion cards (input focused) ── */}
+              {queryFocused && (
+                <div className="space-y-1.5 pb-1">
+                  {suggestionsLoading && !suggestions.length
+                    ? [1, 2, 3, 4].map(i => (
+                        <div key={i} className="h-[42px] bg-[var(--sf2)] rounded-2xl animate-pulse" />
+                      ))
+                    : (suggestions.length ? suggestions : CHIPS).map(chip => (
+                        <button
+                          key={chip}
+                          onMouseDown={e => {
+                            e.preventDefault() // keep input focused long enough to register click
+                            setQuery(chip)
+                            setQueryFocused(false)
+                            setFocusMode(false)
+                            runQuery(chip)
+                          }}
+                          className="w-full text-left px-4 py-[11px] text-[13px] text-[var(--t2)] bg-[var(--sf)] border border-[var(--ln)] hover:border-[#6366f1]/35 hover:text-[var(--t1)] rounded-2xl transition-all leading-snug"
+                        >
+                          {chip}
+                        </button>
+                      ))
+                  }
+                </div>
+              )}
+
+              {/* ── Compact chips (idle, not focused, not in focus-mode) ── */}
+              {!queryFocused && !focusMode && (
+                <div className="flex flex-wrap gap-1.5 items-center">
+                  {suggestionsLoading && !suggestions.length
+                    ? CHIPS.slice(0, 4).map(chip => (
+                        <div key={chip}
+                          className="h-[24px] rounded-full bg-[var(--sf)] border border-[var(--ln)] animate-pulse"
+                          style={{ width: `${chip.length * 6.2 + 20}px` }} />
+                      ))
+                    : (suggestions.length ? suggestions : CHIPS).slice(0, 5).map(chip => (
+                        <button key={chip} onClick={() => { setQuery(chip); runQuery(chip) }}
+                          className="text-[11px] bg-[var(--sf)] border border-[var(--ln)] hover:border-[var(--ln3)] text-[var(--t3)] hover:text-[var(--t1)] px-3 py-1 rounded-full transition-all whitespace-nowrap">
+                          {chip}
+                        </button>
+                      ))
+                  }
+                </div>
+              )}
+
+              {/* ── Input row ── */}
+              <div className="relative flex items-center gap-2">
+                <div className="relative flex-1">
+                  <input
+                    ref={queryInputRef}
+                    type="text"
+                    placeholder="Ask anything about your data…"
+                    value={query}
+                    onChange={e => setQuery(e.target.value)}
+                    onFocus={() => { setQueryFocused(true); setFocusMode(true) }}
+                    onBlur={() => setTimeout(() => { setQueryFocused(false); setFocusMode(false) }, 150)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && !rateLimitLeft) {
+                        runQuery(query)
+                        setQueryFocused(false)
+                        setFocusMode(false)
+                        e.currentTarget.blur()
+                      }
+                      if (e.key === 'Escape') {
+                        setQueryFocused(false)
+                        setFocusMode(false)
+                        e.currentTarget.blur()
+                      }
+                    }}
+                    className="query-input w-full bg-[var(--sf)] border border-[var(--ln2)] rounded-2xl px-5 py-[13px] text-[14px] text-[var(--t1)] placeholder:text-[var(--t4)] focus:outline-none pr-24 transition-colors focus:border-[#6366f1]/50"
+                  />
+                  {query && !loading && (
+                    <button
+                      onMouseDown={e => { e.preventDefault(); setQuery('') }}
+                      className="absolute right-[5rem] top-1/2 -translate-y-1/2 text-[var(--t4)] hover:text-[var(--t2)] transition-colors p-1.5 rounded-lg hover:bg-[var(--sf2)]">
+                      <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
+                        <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                      </svg>
+                    </button>
+                  )}
+                  <button
+                    onMouseDown={e => {
+                      e.preventDefault()
+                      runQuery(query)
+                      setQueryFocused(false)
+                      setFocusMode(false)
+                    }}
+                    disabled={loading || !query.trim() || rateLimitLeft > 0}
+                    title={rateLimitLeft > 0 ? `Rate limited — ${rateLimitLeft}s remaining` : undefined}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 bg-[#6366f1] hover:bg-[#5254cc] disabled:opacity-20 disabled:cursor-not-allowed text-white text-[12px] font-semibold px-4 py-1.5 rounded-xl transition-all"
+                  >
+                    {loading ? '···' : 'Ask'}
+                  </button>
+                </div>
+                <span className="text-[10px] text-[var(--t5)] hidden sm:block tabular shrink-0">⌘K</span>
+              </div>
+
+            </div>
+          </div>
+        </>
       )}
     </div>
   )
