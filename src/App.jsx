@@ -503,6 +503,27 @@ Sample rows:
 ${sample}`
 }
 
+// A static deployment (GitHub Pages, a plain file host) has no /api/query at
+// all, so a POST there comes back 404/405 with an HTML body. Without this the
+// visitor sees a JSON parse error instead of being told what to do about it.
+function noServerKey() {
+  const err = new Error(
+    'This deployment has no server-side key. Add your own free Groq key with the Key button to enable questions — everything else works without one.'
+  )
+  err.status = 503
+  err.needsKey = true
+  return err
+}
+
+async function readJson(res) {
+  const text = await res.text()
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 async function queryLLM(messages, userKey) {
   if (!userKey) {
     const res = await fetch('/api/query', {
@@ -510,10 +531,13 @@ async function queryLLM(messages, userKey) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages }),
     })
-    const data = await res.json()
+    if (res.status === 404 || res.status === 405) throw noServerKey()
+    const data = await readJson(res)
+    if (!data) throw noServerKey()          // not JSON: no function behind this path
     if (!res.ok) {
       const err = new Error(data.error || `Server error ${res.status}`)
       err.status = res.status
+      err.needsKey = res.status === 503
       throw err
     }
     return data.content
@@ -552,9 +576,12 @@ async function streamQueryLLM(messages, userKey, onChunk) {
   }
   const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
+    if (!userKey && (res.status === 404 || res.status === 405)) throw noServerKey()
+    const data = (await readJson(res)) || {}
+    if (!userKey && !Object.keys(data).length) throw noServerKey()
     const err = new Error(data.error?.message || data.error || `Error ${res.status}`)
     err.status = res.status
+    err.needsKey = res.status === 503
     throw err
   }
   const reader = res.body.getReader()

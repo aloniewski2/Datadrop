@@ -1,5 +1,7 @@
 # DataDropAI
 
+**[Try it live →](https://aloniewski2.github.io/Datadrop/)**
+
 **Ask your data anything.** Drop in a CSV or Google Sheet, type a question in plain
 English, and get a chart back in seconds — no formulas, no pivot tables, no setup.
 
@@ -47,12 +49,23 @@ Without it, everything except question-asking still works — loading, charting,
 
 ## Deploying
 
-Vercel-ready as-is: `vercel.json` sets the build, SPA rewrites, and security headers.
+**GitHub Pages** (where the live demo runs) — static, so visitors bring their own key:
+
+```bash
+npm run deploy:pages
+```
+
+**Vercel** — adds the serverless function, so questions work with no key from the
+visitor. `vercel.json` already sets the build, SPA rewrites, and security headers:
 
 ```bash
 vercel
 vercel env add GROQ_API_KEY
 ```
+
+The difference is only *whose* key is used. On Pages the client calls Groq directly with
+a key the visitor pastes in; on Vercel `api/query.js` holds yours and the browser never
+sees it.
 
 ## Full documentation
 

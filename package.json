@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:pages": "GH_PAGES=1 vite build",
+    "deploy:pages": "GH_PAGES=1 vite build && cd dist && touch .nojekyll && git init -q && git checkout -qB gh-pages && git add -A && git commit -qm deploy && git remote add origin https://github.com/aloniewski2/Datadrop.git 2>/dev/null; git push -qf origin gh-pages"
   },
   "dependencies": {
     "d3": "^7.9.0",
